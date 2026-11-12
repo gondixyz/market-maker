@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "exposureLimit": "3",
+  "pollSeconds": 15,
+  "lossLimits": { "dailyUsd": 3000, "weeklyUsd": 10000, "since": "2026-11-04T00:00:00Z" },
+  "tasks": [
+    {
+      "id": "pudgy-floor-bid",
+      "kind": "collectionBid",
+      "collection": "pudgypenguins",
+      "pricing": { "mode": "outbid", "steps": 1 },
+      "minPrice": "1.5",
+      "maxPrice": "2.2",
+      "expirationMinutes": 60,
+      "haltOnFloorMovePercent": 10
+    }
+  ]
+}

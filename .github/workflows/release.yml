@@ -1,0 +1,93 @@
+# Runs on the public mirror only: a `v<version>` tag, naming package.json's version, builds the
+# desktop installers (macOS DMGs for Apple silicon and Intel, a Windows installer) and publishes
+# them as that tag's GitHub release, its notes the version's CHANGELOG.md section and how to install. They are not signed by a developer certificate, so macOS and
+# Windows warn on first launch; the release notes say how to open them.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - name: Check the tag names the package's version
+        run: |
+          version="v$(jq -r .version package.json)"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json's $version"
+            exit 1
+          fi
+      - name: Check the changelog has the version's section
+        run: |
+          if ! grep -qx "# ${GITHUB_REF_NAME#v}" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '# ${GITHUB_REF_NAME#v}' section"
+            exit 1
+          fi
+      - run: bun install --frozen-lockfile
+      - run: bun run verify
+
+  build:
+    needs: verify
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: mac
+            runner: macos-latest
+            installers: dist/*.dmg
+          - platform: win
+            runner: windows-latest
+            installers: dist/*.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run build:desktop
+      - run: bunx electron-builder --${{ matrix.platform }} --publish never
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installers-${{ matrix.platform }}
+          path: ${{ matrix.installers }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: installers-*
+          path: installers
+          merge-multiple: true
+      - name: Write the release notes
+        run: |
+          awk -v heading="# ${GITHUB_REF_NAME#v}" '
+            $0 == heading { found = 1; next }
+            found && /^# / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          printf '\n## Installing\n\n' >> notes.md
+          cat .github/release-notes.md >> notes.md
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" installers/*
+          --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --verify-tag
+          --notes-file notes.md
