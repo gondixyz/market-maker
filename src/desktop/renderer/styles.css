@@ -1,0 +1,889 @@
+/* Values resolved from gondi.xyz's theme tokens. */
+:root {
+  --layout-bg: #f2f2f2;
+  --card: #ffffff;
+  --inner: #f9f6f1;
+  --on-surface: #141414;
+  --on-surface-variant: #474747;
+  --outline: #adadad;
+  --outline-variant: #e0e0e0;
+  --field: #ffffff;
+  --field-stroke: #e0e0e0;
+  --field-stroke-hover: #adadad;
+  --filled: #141414;
+  --on-filled: #ffffff;
+  --brand: #254535;
+  --brand-hover: #37674f;
+  --outlined-stroke: #e0e0e0;
+  --positive: #498869;
+  --positive-surface: #f2f8f5;
+  --attention: #a9470f;
+  --attention-surface: #fdf1e9;
+  --negative: #b7261f;
+  --negative-surface: #fbe9e8;
+  --neutral-surface: #f2f2f2;
+  --focus: #5ca882;
+  --radius-control: 10px;
+  --radius-card: 16px;
+  --control-height: 36px;
+  color-scheme: light;
+  font-family: suisse, Arial, Helvetica, sans-serif;
+}
+
+:root[data-theme='dark'] {
+  --layout-bg: #232323;
+  --card: #2a2a2a;
+  --inner: #232323;
+  --on-surface: #fafafa;
+  --on-surface-variant: #c7c7c7;
+  --outline: #7a7a7a;
+  --outline-variant: #2e2e2e;
+  --field: #141414;
+  --field-stroke: #141414;
+  --field-stroke-hover: #7a7a7a;
+  --filled: #ffffff;
+  --on-filled: #000000;
+  --brand: #37674f;
+  --brand-hover: #254535;
+  --outlined-stroke: #474747;
+  --positive: #7eba9c;
+  --positive-surface: #1f2b24;
+  --attention: #f1945f;
+  --attention-surface: #3a2a20;
+  --negative: #e35f59;
+  --negative-surface: #3a1d1b;
+  --neutral-surface: #3a3a3a;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--layout-bg);
+  color: var(--on-surface);
+  font-size: 14px;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.topBar {
+  align-items: center;
+  background: var(--layout-bg);
+  border-bottom: 1px solid var(--outline-variant);
+  display: flex;
+  gap: 12px;
+  padding: 16px 24px;
+}
+
+.statusBanner {
+  align-items: center;
+  border-bottom: 1px solid var(--outline-variant);
+  display: flex;
+  font-size: 13px;
+  gap: 8px;
+  justify-content: center;
+  padding: 6px 24px;
+}
+
+.statusBanner.running {
+  background: var(--positive-surface);
+  color: var(--positive);
+}
+
+.statusBanner.stopped {
+  background: var(--neutral-surface);
+  color: var(--on-surface-variant);
+}
+
+.statusDot {
+  background: currentColor;
+  border-radius: 50%;
+  height: 8px;
+  width: 8px;
+}
+
+.topBarEnd {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  margin-left: auto;
+}
+
+.wallet {
+  position: relative;
+}
+
+.walletChip {
+  align-items: center;
+  background: var(--card);
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-control);
+  color: var(--on-surface);
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  gap: 14px;
+  height: var(--control-height);
+  padding: 0 12px;
+}
+
+.walletChip:hover,
+.walletChip[aria-expanded='true'] {
+  border-color: var(--outline);
+}
+
+.balance {
+  align-items: center;
+  display: inline-flex;
+  font-variant-numeric: tabular-nums;
+  gap: 5px;
+}
+
+.walletIdentity {
+  align-items: center;
+  border-left: 1px solid var(--outline-variant);
+  display: inline-flex;
+  gap: 8px;
+  padding-left: 12px;
+}
+
+.avatar {
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+  object-fit: cover;
+}
+
+.walletNames {
+  display: grid;
+  line-height: 1.15;
+  text-align: left;
+}
+
+.walletName {
+  font-size: 13px;
+  font-weight: 500;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.walletAddress {
+  color: var(--on-surface-variant);
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.walletProfile {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.walletProfileName {
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.walletMenu {
+  background: var(--card);
+  border: 1px solid var(--outline-variant);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.18);
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+  padding: 14px;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  width: 360px;
+  z-index: 1;
+}
+
+.walletMenu .address {
+  font-size: 12px;
+  user-select: all;
+  word-break: break-all;
+}
+
+.segmented.icons button {
+  align-items: center;
+  display: inline-flex;
+  justify-content: center;
+  padding: 0;
+  width: 32px;
+}
+
+.product {
+  border-left: 1px solid var(--outline-variant);
+  color: var(--on-surface-variant);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  padding-left: 12px;
+  text-transform: uppercase;
+}
+
+.version {
+  color: var(--on-surface-variant);
+  font-size: 12px;
+}
+
+main {
+  display: grid;
+  gap: 16px;
+  margin: 0 auto;
+  max-width: 920px;
+  padding: 24px;
+}
+
+main.columns {
+  align-items: start;
+  grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+  max-width: 1440px;
+}
+
+main.settings {
+  max-width: 640px;
+}
+
+.column {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  main.columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-card);
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+}
+
+.cardHeader {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+h2 {
+  font-size: 16px;
+  font-weight: 500;
+  margin: 0;
+}
+
+p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.muted {
+  color: var(--on-surface-variant);
+}
+
+.positiveText {
+  color: var(--positive);
+}
+
+.row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+}
+
+.address {
+  background: var(--inner);
+  border-radius: var(--radius-control);
+  font-size: 13px;
+  padding: 9px 12px;
+}
+
+.button {
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-weight: 500;
+  height: var(--control-height);
+  justify-content: center;
+  padding: 0 16px;
+  transition:
+    background-color 120ms ease-out,
+    border-color 120ms ease-out,
+    opacity 120ms ease-out;
+}
+
+.button.small {
+  height: 28px;
+  padding: 0 12px;
+}
+
+.button.filled {
+  background: var(--filled);
+  color: var(--on-filled);
+}
+
+.button.brand {
+  background: var(--brand);
+  color: #ffffff;
+}
+
+.button.brand:hover:not(:disabled) {
+  background: var(--brand-hover);
+}
+
+.button.outlined {
+  background: transparent;
+  border-color: var(--outlined-stroke);
+  color: var(--on-surface);
+}
+
+.button.outlined:hover:not(:disabled) {
+  border-color: var(--outline);
+}
+
+.button.filled:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.button.danger {
+  color: var(--negative);
+}
+
+.button:disabled {
+  background: var(--outline-variant);
+  border-color: transparent;
+  color: var(--outline);
+  cursor: default;
+}
+
+.button:focus-visible,
+.segmented button:focus-visible,
+input:not(.control input):focus-visible,
+select:not(.control select):focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.field {
+  align-content: start;
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+}
+
+.fieldLabel {
+  color: var(--on-surface-variant);
+  font-size: 12px;
+}
+
+.control {
+  align-items: center;
+  background: var(--field);
+  border: 1px solid var(--field-stroke);
+  border-radius: var(--radius-control);
+  display: flex;
+  height: var(--control-height);
+  transition: border-color 120ms ease-out;
+}
+
+.control:hover {
+  border-color: var(--field-stroke-hover);
+}
+
+.control:focus-within {
+  border-color: var(--focus);
+}
+
+.control.grow {
+  flex: 1;
+  min-width: 240px;
+}
+
+.invalid .control {
+  border-color: var(--negative);
+}
+
+.control input,
+.control select {
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: inherit;
+  flex: 1;
+  font: inherit;
+  height: 100%;
+  min-width: 0;
+  padding: 0 12px;
+}
+
+.control select {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 17px) 50%,
+    calc(100% - 12px) 50%;
+  background-repeat: no-repeat;
+  background-size:
+    5px 5px,
+    5px 5px;
+  cursor: pointer;
+  padding-right: 28px;
+}
+
+.control select option {
+  background: var(--card);
+}
+
+.control input:disabled,
+.control select:disabled {
+  color: var(--outline);
+}
+
+.unit {
+  color: var(--on-surface-variant);
+  font-size: 12px;
+  padding-right: 12px;
+  white-space: nowrap;
+}
+
+.fieldError {
+  color: var(--negative);
+  font-size: 12px;
+}
+
+.toggle {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+}
+
+.toggle input {
+  accent-color: var(--brand-hover);
+  height: 16px;
+  width: 16px;
+}
+
+.task {
+  background: var(--inner);
+  border-radius: 12px;
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.task.summary {
+  align-items: center;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: auto auto minmax(0, 1fr) 112px minmax(0, 1.2fr) auto;
+  padding: 10px 12px;
+}
+
+.task.summary.off > :not(.switch, .iconButton) {
+  opacity: 0.5;
+}
+
+.summaryNames {
+  display: grid;
+  line-height: 1.25;
+  min-width: 0;
+}
+
+.summaryLine {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.task.summary .grow {
+  text-align: right;
+}
+
+.iconButton {
+  align-items: center;
+  background: var(--card);
+  border: 1px solid var(--outlined-stroke);
+  border-radius: var(--radius-control);
+  color: var(--on-surface);
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  height: var(--control-height);
+  justify-content: center;
+  transition:
+    background-color 120ms ease-out,
+    border-color 120ms ease-out;
+  width: var(--control-height);
+}
+
+.iconButton:hover:not(:disabled),
+.iconButton.selected {
+  border-color: var(--outline);
+}
+
+.iconButton.filled {
+  background: var(--filled);
+  border-color: var(--filled);
+  color: var(--on-filled);
+}
+
+.iconButton.filled:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.iconButton:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.switch {
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.switch input {
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  position: absolute;
+  width: 100%;
+}
+
+.switch span {
+  background: var(--outline);
+  border-radius: 999px;
+  display: inline-block;
+  height: 20px;
+  position: relative;
+  transition: background-color 120ms ease-out;
+  width: 34px;
+}
+
+.switch span::after {
+  background: #ffffff;
+  border-radius: 50%;
+  content: '';
+  height: 16px;
+  left: 2px;
+  position: absolute;
+  top: 2px;
+  transition: transform 120ms ease-out;
+  width: 16px;
+}
+
+.switch input:checked + span {
+  background: var(--brand-hover);
+}
+
+.switch input:checked + span::after {
+  transform: translateX(14px);
+}
+
+.switch input:focus-visible + span {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.switch input:disabled + span {
+  opacity: 0.5;
+}
+
+.taskHeader {
+  align-items: start;
+  display: flex;
+  gap: 8px;
+}
+
+.taskIdentity {
+  display: grid;
+  flex: 0 1 280px;
+  gap: 8px;
+  justify-items: start;
+  min-width: 0;
+}
+
+.taskIdentity .field {
+  width: 100%;
+}
+
+.iconButton.danger {
+  color: var(--negative);
+}
+
+.iconButton.danger:hover:not(:disabled) {
+  background: var(--negative-surface);
+  border-color: var(--negative);
+}
+
+.iconButton:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.segmented {
+  background: var(--field);
+  border-radius: var(--radius-control);
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+}
+
+.segmented button {
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--on-surface-variant);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 500;
+  height: 28px;
+  padding: 0 12px;
+}
+
+.segmented button.selected {
+  background: var(--filled);
+  color: var(--on-filled);
+}
+
+.segmented button:disabled {
+  cursor: default;
+}
+
+.notice {
+  background: var(--neutral-surface);
+  border-radius: var(--radius-control);
+  padding: 10px 12px;
+}
+
+.notice.negative {
+  background: var(--negative-surface);
+  color: var(--negative);
+}
+
+.notice.attention {
+  background: var(--attention-surface);
+  color: var(--attention);
+}
+
+.pill {
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 3px 10px;
+  white-space: nowrap;
+}
+
+.pill.positive {
+  background: var(--positive-surface);
+  color: var(--positive);
+}
+
+.pill.attention {
+  background: var(--attention-surface);
+  color: var(--attention);
+}
+
+.pill.negative {
+  background: var(--negative-surface);
+  color: var(--negative);
+}
+
+.pill.neutral {
+  background: var(--neutral-surface);
+  color: var(--on-surface-variant);
+}
+
+.states {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.states li {
+  align-items: center;
+  background: var(--inner);
+  border-radius: var(--radius-control);
+  display: grid;
+  gap: 4px 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 10px 12px;
+}
+
+.states .detail {
+  grid-column: 1 / -1;
+}
+
+.taskName {
+  font-weight: 500;
+}
+
+.detail {
+  color: var(--on-surface-variant);
+  font-size: 13px;
+}
+
+.picker {
+  align-items: center;
+  display: flex;
+  flex: 1;
+  gap: 8px;
+  height: 100%;
+  min-width: 0;
+  padding-left: 10px;
+  position: relative;
+}
+
+.control .picker input {
+  padding-left: 0;
+}
+
+.thumbnail {
+  border-radius: 6px;
+  flex-shrink: 0;
+  object-fit: cover;
+}
+
+.thumbnail.placeholder {
+  background: var(--neutral-surface);
+  display: inline-block;
+}
+
+.pickerList {
+  background: var(--card);
+  border: 1px solid var(--outline-variant);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.18);
+  left: -1px;
+  list-style: none;
+  margin: 0;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 6px;
+  position: absolute;
+  right: -1px;
+  top: calc(100% + 6px);
+  z-index: 2;
+}
+
+.pickerList li {
+  align-items: center;
+  border-radius: 8px;
+  cursor: pointer;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr);
+  padding: 6px 8px;
+}
+
+.pickerList li.highlighted {
+  background: var(--inner);
+}
+
+.pickerNames {
+  display: grid;
+  line-height: 1.25;
+  min-width: 0;
+}
+
+.pickerName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pickerSlug {
+  color: var(--on-surface-variant);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pickerList li.pickerEmpty {
+  color: var(--on-surface-variant);
+  cursor: default;
+  display: block;
+}
+
+.venueLabel {
+  align-items: center;
+  display: inline-flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.venueSelect {
+  padding-left: 0;
+}
+
+.venueSelect button {
+  background-color: transparent;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 17px) 50%,
+    calc(100% - 12px) 50%;
+  background-repeat: no-repeat;
+  background-size:
+    5px 5px,
+    5px 5px;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  flex: 1;
+  font: inherit;
+  height: 100%;
+  outline: none;
+  padding: 0 28px 0 12px;
+  text-align: left;
+}
+
+.venueSelect button:disabled {
+  color: var(--outline);
+  cursor: default;
+}
+
+.venueSelect .pickerList li {
+  display: flex;
+}
