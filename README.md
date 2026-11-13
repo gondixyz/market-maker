@@ -43,9 +43,14 @@ wallet and small limits, and watch it before you leave it running.
 
 ## Download
 
-The desktop app's installers are on the
-[Releases](https://github.com/gondixyz/market-maker/releases) page: a DMG for Macs with Apple
-silicon, one for Intel Macs, and an installer for Windows. To open it the first time:
+Download the latest desktop app for your computer:
+
+[![Download for Mac with Apple silicon](https://img.shields.io/badge/Mac-Apple_silicon-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/gondixyz/market-maker/releases/latest/download/gondi-market-maker-mac-arm64.dmg)
+[![Download for Mac with Intel](https://img.shields.io/badge/Mac-Intel-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/gondixyz/market-maker/releases/latest/download/gondi-market-maker-mac-x64.dmg)
+[![Download for Windows](https://img.shields.io/badge/Windows-x64-0078D4?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/gondixyz/market-maker/releases/latest/download/gondi-market-maker-win-x64.exe)
+
+Earlier versions are on the [Releases](https://github.com/gondixyz/market-maker/releases) page. To
+open the app the first time:
 
 - **macOS**: drag the app to Applications and open it; at "Apple could not verify", click Done, then
   System Settings → Privacy & Security → **Open Anyway**.

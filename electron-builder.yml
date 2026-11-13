@@ -1,6 +1,6 @@
 appId: xyz.gondi.market-maker
 productName: GONDI Market Maker
-artifactName: gondi-market-maker-${version}-${os}-${arch}.${ext}
+artifactName: gondi-market-maker-${os}-${arch}.${ext}
 directories:
   output: dist
 files:
