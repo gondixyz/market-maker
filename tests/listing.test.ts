@@ -14,9 +14,14 @@ const decide = (overrides: Partial<DecideListingInput> = {}) =>
   decideListing({ task: listingTaskOf(), snapshot: listingSnapshotOf(), now: NOW, ...overrides });
 
 describe('targetListingPrice', () => {
-  test('undercuts the cheapest competing listing by the configured steps', () => {
-    const task = listingTaskOf({ pricing: { mode: 'undercut', steps: 3 } });
+  test('undercuts the cheapest competing listing by the configured amount', () => {
+    const task = listingTaskOf({ pricing: { mode: 'undercut', amount: '0.03' } });
     expect(targetListingPrice(task, listingSnapshotOf())).toBe(eth('9.97'));
+  });
+
+  test('lists at the minimum when the undercut lands under it', () => {
+    const task = listingTaskOf({ pricing: { mode: 'undercut', amount: '5' } });
+    expect(targetListingPrice(task, listingSnapshotOf())).toBe(eth('9'));
   });
 
   test('lists at the maximum when nothing else is listed', () => {
@@ -71,7 +76,17 @@ describe('decideListing', () => {
       lowestCompetingAsk: eth('11'),
       ownListings: [listingOf()],
     });
-    expect(decide({ snapshot })).toEqual({ type: 'wait', reason: 'needsOnChainCancel' });
+    expect(decide({ snapshot })).toEqual({
+      type: 'wait',
+      reason: 'needsOnChainCancel',
+      listing: listingOf(),
+    });
+  });
+
+  test('lists again when the live listing expired, though the API still says Active', () => {
+    const expired = listingOf({ expiration: new Date(NOW.getTime() - 60_000) });
+    const snapshot = listingSnapshotOf({ lowestCompetingAsk: eth('11'), ownListings: [expired] });
+    expect(decide({ snapshot })).toEqual({ type: 'place', price: eth('10.99') });
   });
 
   test('judges against the cheapest live listing, ignoring dominated older ones', () => {

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 const CLI = new URL('../src/cli/index.ts', import.meta.url).pathname;
 
-describe.each(['approve', 'approve-opensea'])('%s', (command) => {
+describe.each(['approve', 'approve-opensea', 'wrap'])('%s', (command) => {
   test.each([
     { amount: '0', positionals: ['0'] },
     { amount: 'lots', positionals: ['lots'] },

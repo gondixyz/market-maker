@@ -1,19 +1,27 @@
-import { BaseError, formatEther, type LocalAccount } from 'viem';
+import { BaseError, formatEther, type LocalAccount, maxUint256 } from 'viem';
 
 import { describeLoss, describeTaskState } from '../../engine/describe';
-import type { Market, Venue } from '../../engine/market';
+import { type Market, type Venue, VENUES } from '../../engine/market';
 import { Runner, type TaskState } from '../../engine/runner';
 import { bidsOnOpenSea, parsePositiveEther, type TasksFile } from '../../engine/task';
-import { WETH_SPENDER } from '../../gondi/client';
+import {
+  type CollectionApproval,
+  operatorName,
+  type SentApproval,
+  WETH_SPENDER,
+} from '../../gondi/client';
 import type {
   ApprovalResult,
   CancelListingsResult,
+  CollectionApprovalResult,
   CollectionOption,
+  CollectionPricing,
   DesktopApi,
   DesktopStatus,
   SaveTasksResult,
   WalletBalances,
   WalletProfile,
+  WethAllowance,
 } from '../api';
 
 /** OpenSea API keys are 32 hex characters; this accepts any plausible token without spaces. */
@@ -56,15 +64,33 @@ export type ControllerDependencies = {
    */
   useRpcUrl(url: string | null): void;
   marketFor(account: LocalAccount, openSeaApiKey: string | null): Market;
-  approveWeth(account: LocalAccount, amount: bigint, venue: Venue): Promise<string>;
+  /** Broadcasts the approval; it resolves before the transaction is mined. */
+  sendWethApproval(account: LocalAccount, amount: bigint, venue: Venue): Promise<SentApproval>;
+  /** The operator the `slug` collection's listings need approved, and whether it is already. */
+  collectionApproval(account: LocalAccount, slug: string): Promise<CollectionApproval>;
+  /** Broadcasts the collection's approval; it resolves before the transaction is mined. */
+  sendCollectionApproval(
+    account: LocalAccount,
+    approval: CollectionApproval,
+  ): Promise<SentApproval>;
   /** The ids of the account's active GONDI listings on the collections of `slugs`. */
   activeListings(account: LocalAccount, slugs: string[]): Promise<number[]>;
   /** Cancels the listings on-chain; resolves with each mined transaction's hash. */
   cancelListings(account: LocalAccount, orderIds: number[]): Promise<string[]>;
   balancesOf(account: LocalAccount): Promise<{ eth: bigint; weth: bigint }>;
+  /** What each venue's spender may spend of the account's WETH, in wei. */
+  allowancesOf(account: LocalAccount): Promise<Record<Venue, bigint>>;
   profileOf(account: LocalAccount): Promise<WalletProfile>;
   /** The picker's collections: the week's most traded, or those `searchTerm` matches. */
   pickableCollections(searchTerm?: string): Promise<CollectionOption[]>;
+  /**
+   * The `slug` collection's price step on `venue`, its floor and its top bid (`null` if none,
+   * `undefined` if it could not be read), in wei.
+   */
+  collectionPricingOf(
+    slug: string,
+    venue: Venue,
+  ): Promise<{ priceStep: bigint; floor: bigint | null; topBid: bigint | null | undefined }>;
   /** Asks the user, outside the window, to confirm an on-chain action. */
   confirm(message: string): Promise<boolean>;
   /** Keeps the computer from suspending the app while the bot runs. */
@@ -73,6 +99,17 @@ export type ControllerDependencies = {
   /** Sends the window a fresh status. */
   publish(status: DesktopStatus): void;
 };
+
+/**
+ * An allowance as the window shows it.
+ *
+ * IMPLEMENTATION NOTE: WETH's `transferFrom` leaves an allowance of `type(uint256).max` untouched
+ * and subtracts every other one (WETH9, `if (src != msg.sender && allowance[src][msg.sender] !=
+ * uint(-1))`, https://etherscan.io/address/0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2#code), so
+ * only that exact value is unlimited.
+ */
+const wethAllowanceOf = (amount: bigint): WethAllowance =>
+  amount === maxUint256 ? { kind: 'unlimited' } : { kind: 'limited', weth: formatEther(amount) };
 
 /** An http(s) URL, the transport the bot reads and sends through; throws on anything else. */
 const parseRpcUrl = (url: string) => {
@@ -120,6 +157,8 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
   private keyError: string | null = null;
   private loss: string | null = null;
   private collectionOptions: Promise<CollectionOption[]> | undefined;
+  /** Each approval sent this session that the window has not yet waited out, by hash. */
+  private readonly pendingApprovals = new Map<string, SentApproval>();
 
   constructor(private readonly dependencies: ControllerDependencies) {}
 
@@ -302,18 +341,72 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
 
   async approveWeth(amount: string, venue: Venue): Promise<ApprovalResult> {
     const wei = parsePositiveEther(amount);
+    return this.approve(venue, wei, (address) => `spend up to ${amount} WETH from ${address}`);
+  }
+
+  /** The maximum approval, which WETH never draws down, so filled bids never use it up. */
+  async approveUnlimitedWeth(venue: Venue): Promise<ApprovalResult> {
+    return this.approve(
+      venue,
+      maxUint256,
+      (address) =>
+        `spend any amount of WETH from ${address}, with no limit, until you approve a smaller amount`,
+    );
+  }
+
+  /** Asks the user to let `venue`'s spender `allowed`, and sends the approval of `wei` once they do. */
+  private async approve(venue: Venue, wei: bigint, allowed: (address: string) => string) {
     const account = await this.requireAccount();
     const confirmed = await this.dependencies.confirm(
-      `Let ${WETH_SPENDER[venue].name} spend up to ${amount} WETH from ${account.address}?\n\nThis sends a transaction and costs gas.`,
+      `Let ${WETH_SPENDER[venue].name} ${allowed(account.address)}?\n\nThis sends a transaction and costs gas.`,
+    );
+    if (!confirmed) return { outcome: 'declined' } as const;
+    return this.track(await this.dependencies.sendWethApproval(account, wei, venue));
+  }
+
+  /** Keeps a sent approval for `approvalMined` to wait on, and tells the window its hash. */
+  private track(approval: SentApproval) {
+    this.pendingApprovals.set(approval.transactionHash, approval);
+    return { outcome: 'sent', transactionHash: approval.transactionHash } as const;
+  }
+
+  /**
+   * Waits for an approval this session sent; only those, so the window cannot have main wait on
+   * an arbitrary hash.
+   */
+  async approvalMined(transactionHash: string): Promise<void> {
+    const approval = this.pendingApprovals.get(transactionHash);
+    if (!approval) throw new Error(`no approval ${transactionHash} is pending`);
+    try {
+      await approval.waitMined();
+    } finally {
+      this.pendingApprovals.delete(transactionHash);
+    }
+  }
+
+  async approveCollection(slug: string): Promise<CollectionApprovalResult> {
+    const collection = slug.trim();
+    if (!collection) throw new Error('pick a collection first');
+    const account = await this.requireAccount();
+    const approval = await this.dependencies.collectionApproval(account, collection);
+    if (approval.approved) return { outcome: 'alreadyApproved' };
+    const confirmed = await this.dependencies.confirm(
+      `Let ${operatorName(approval.operator)} move every ${collection} item from ${account.address}, so they can be listed?\n\nThis sends a transaction and costs gas.`,
     );
     if (!confirmed) return { outcome: 'declined' };
-    const transactionHash = await this.dependencies.approveWeth(account, wei, venue);
-    return { outcome: 'approved', transactionHash };
+    return this.track(await this.dependencies.sendCollectionApproval(account, approval));
   }
 
   async balances(): Promise<WalletBalances> {
     const { eth, weth } = await this.dependencies.balancesOf(await this.requireAccount());
     return { eth: formatEther(eth), weth: formatEther(weth) };
+  }
+
+  async allowances(): Promise<Record<Venue, WethAllowance>> {
+    const amounts = await this.dependencies.allowancesOf(await this.requireAccount());
+    return Object.fromEntries(
+      VENUES.map((venue) => [venue, wethAllowanceOf(amounts[venue])]),
+    ) as Record<Venue, WethAllowance>;
   }
 
   /** Read once per session; a failed read is not kept, so the next call tries again. */
@@ -328,6 +421,18 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
   /** The pickable collections `query` matches by name or slug, read afresh each time. */
   searchCollections(query: string) {
     return this.dependencies.pickableCollections(query.trim());
+  }
+
+  async collectionPricing(slug: string, venue: Venue): Promise<CollectionPricing> {
+    const { priceStep, floor, topBid } = await this.dependencies.collectionPricingOf(
+      slug.trim(),
+      venue,
+    );
+    return {
+      priceStep: formatEther(priceStep),
+      floor: floor === null ? null : formatEther(floor),
+      topBid: topBid === null || topBid === undefined ? topBid : formatEther(topBid),
+    };
   }
 
   async profile(): Promise<WalletProfile> {
@@ -363,11 +468,15 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
 
   /**
    * Builds a runner over `file`. It refuses nothing about the OpenSea API key: without one, only
-   * the OpenSea tasks fail, so cancel-all still withdraws every other task's bids.
+   * the OpenSea tasks fail, so cancel-all still withdraws every other task's bids. It drops
+   * `wrapEth`, as the desktop app sends no transaction without a confirmation in main.
    */
   private async createRunner(file: TasksFile, openSeaApiKey: string | null) {
     const account = await this.requireAccount();
-    const runner = new Runner(this.dependencies.marketFor(account, openSeaApiKey), file);
+    const runner = new Runner(this.dependencies.marketFor(account, openSeaApiKey), {
+      ...file,
+      wrapEth: undefined,
+    });
     const previous = new Map<string, TaskState>();
     runner.on('state', (taskId, state) => {
       if (isAlert(state, previous.get(taskId))) {

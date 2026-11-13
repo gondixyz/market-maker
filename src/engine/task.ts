@@ -5,6 +5,24 @@ import { VENUES } from './market';
 
 export const MAX_TASKS = 25;
 
+/** The most offers one bid task's `ladder` keeps live. */
+export const MAX_LADDER_OFFERS = 10;
+
+/**
+ * The shortest and default lifetime of a listing. A listing the bot replaced stays live until it
+ * expires, so a short lifetime is what keeps replaced listings from piling up.
+ */
+export const LISTING_EXPIRATION_MINUTES = 5;
+
+/**
+ * The shortest lifetime of a bid. It stays above OpenSea's off-chain cancel delay (5.5 minutes),
+ * so an offer becomes cancellable, and is refreshed, before it expires.
+ */
+export const MIN_BID_EXPIRATION_MINUTES = 15;
+
+/** The default lifetime of a bid. Bids are cancelled off-chain, so a long one leaves nothing up. */
+export const BID_EXPIRATION_MINUTES = 60;
+
 const ether = z
   .string()
   .regex(/^\d+(\.\d{1,18})?$/, 'expected an ETH amount such as "1.25"')
@@ -68,8 +86,19 @@ const listingPricingRule = z.discriminatedUnion('mode', [
   z.object({ mode: z.literal('fixed'), price: ether }),
   /** A share of the cheapest competing listing, e.g. 105 lists 5% above it. */
   z.object({ mode: z.literal('floor'), percent: z.number().positive().max(1_000) }),
-  /** The cheapest competing listing minus `steps` price steps; `maxPrice` when nothing else is listed. */
-  z.object({ mode: z.literal('undercut'), steps: z.number().int().positive().default(1) }),
+  /**
+   * The cheapest competing listing minus `amount` ETH; `maxPrice` when nothing else is listed.
+   * GONDI listings are not price-stepped, so the amount is the seller's own, not a count of the
+   * collection's bid steps; a file still counting `steps` is refused rather than guessed at.
+   */
+  z.object({
+    mode: z.literal('undercut'),
+    amount: z
+      .string({ error: 'expected an amount in ETH such as "0.0001"' })
+      .pipe(ether)
+      .refine((amount) => amount > 0n, 'must be above 0'),
+    steps: z.never({ error: 'undercut now takes an amount in ETH, not steps' }).optional(),
+  }),
 ]);
 
 const tokenId = z
@@ -85,11 +114,15 @@ const taskFields = {
   collection: z.string().min(1),
   minPrice: ether,
   maxPrice: ether,
-  expirationMinutes: z.number().int().min(15).default(60),
 };
 
 const bidFields = {
   ...taskFields,
+  expirationMinutes: z
+    .number()
+    .int()
+    .min(MIN_BID_EXPIRATION_MINUTES)
+    .default(BID_EXPIRATION_MINUTES),
   pricing: pricingRule,
   haltOnFloorMovePercent: z.number().positive().optional(),
   /** The bid never goes above this share of the floor, and does not bid without a floor. */
@@ -115,6 +148,17 @@ const task = z
        * the floor, plus the live bid stay within this many ETH.
        */
       maxHeldValue: ether.optional(),
+      /**
+       * Keep `offers` offers live instead of one: the top one at the `pricing` price, the others on
+       * the next multiples of `spacing` ETH below it, none under `minPrice`. They share the top
+       * offer's WETH, so `exposureLimit` counts the task as its top offer alone.
+       */
+      ladder: z
+        .object({
+          offers: z.number().int().positive().max(MAX_LADDER_OFFERS),
+          spacing: ether.refine((spacing) => spacing > 0n, 'spacing must be above zero'),
+        })
+        .optional(),
     }),
     /**
      * A listing of one item the wallet owns or, without `tokenId`, of every item of the collection
@@ -123,6 +167,13 @@ const task = z
     z.object({
       ...taskFields,
       kind: z.literal('listing'),
+      /** Above zero: a rule that prices under it lists at it, and a 0 ETH listing gives the item away. */
+      minPrice: ether.refine((wei) => wei > 0n, 'must be above 0'),
+      expirationMinutes: z
+        .number()
+        .int()
+        .min(LISTING_EXPIRATION_MINUTES)
+        .default(LISTING_EXPIRATION_MINUTES),
       tokenId: tokenId.optional(),
       pricing: listingPricingRule,
     }),
@@ -152,6 +203,11 @@ const tasksFile = z
     exposureLimit: ether,
     pollSeconds: z.number().int().min(5).default(15),
     lossLimits: lossLimits.optional(),
+    /**
+     * Wrap ETH into WETH each round the wallet's WETH is under `exposureLimit`, keeping `keepEth`
+     * ETH for gas, so a listing that sells for ETH funds the bids again. Off when omitted.
+     */
+    wrapEth: z.object({ keepEth: ether }).optional(),
     tasks: z.array(task).max(MAX_TASKS),
   })
   .refine(

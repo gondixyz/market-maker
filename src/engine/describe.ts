@@ -1,13 +1,15 @@
 import { formatEther } from 'viem';
 
 import type { LossReport } from './pnl';
-import type { TaskState } from './runner';
+import type { TaskState, WrapReport } from './runner';
 
 /** A task's state in one line, for the CLI log and the desktop task list. */
 export const describeTaskState = (state: TaskState) => {
   switch (state.status) {
     case 'bidding':
-      return `bidding ${formatEther(state.price)} WETH (bid ${state.bidId})`;
+      return `bidding ${formatEther(state.price)} WETH (bid ${state.bidId})${
+        state.offers > 1 ? `, ${state.offers} offers` : ''
+      }`;
     case 'listing':
       return `listed at ${formatEther(state.price)} ETH (listing ${state.listingId})`;
     case 'listingInventory':
@@ -43,3 +45,9 @@ export const describeLoss = (report: LossReport) => {
     : '';
   return `${report.reached ? `${loss}, at a cap: not bidding` : loss}${stale}`;
 };
+
+/** A round's `wrapEth` top-up in one line, for the CLI log. */
+export const describeWrap = (report: WrapReport) =>
+  report.status === 'wrapped'
+    ? `wrapped ${formatEther(report.amount)} ETH into WETH`
+    : `could not wrap ETH into WETH: ${report.error}`;

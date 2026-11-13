@@ -34,14 +34,27 @@ export const registerHandlers = (ipc: HandlerRegistry, controller: DesktopContro
   ipc.handle(INVOKE_CHANNELS.stop, () => controller.stop());
   ipc.handle(INVOKE_CHANNELS.cancelAll, () => controller.cancelAll());
   ipc.handle(INVOKE_CHANNELS.balances, () => controller.balances());
+  ipc.handle(INVOKE_CHANNELS.allowances, () => controller.allowances());
   ipc.handle(INVOKE_CHANNELS.profile, () => controller.profile());
   ipc.handle(INVOKE_CHANNELS.collections, () => controller.collections());
   ipc.handle(INVOKE_CHANNELS.searchCollections, (_event, query) =>
     controller.searchCollections(asString(query)),
   );
+  ipc.handle(INVOKE_CHANNELS.collectionPricing, (_event, slug, venue) =>
+    controller.collectionPricing(asString(slug), asVenue(venue)),
+  );
   ipc.handle(INVOKE_CHANNELS.cancelAllListings, () => controller.cancelAllListings());
   ipc.handle(INVOKE_CHANNELS.approveWeth, (_event, amount, venue) =>
     controller.approveWeth(asString(amount), asVenue(venue)),
+  );
+  ipc.handle(INVOKE_CHANNELS.approveUnlimitedWeth, (_event, venue) =>
+    controller.approveUnlimitedWeth(asVenue(venue)),
+  );
+  ipc.handle(INVOKE_CHANNELS.approvalMined, (_event, transactionHash) =>
+    controller.approvalMined(asString(transactionHash)),
+  );
+  ipc.handle(INVOKE_CHANNELS.approveCollection, (_event, slug) =>
+    controller.approveCollection(asString(slug)),
   );
   ipc.handle(INVOKE_CHANNELS.importOpenSeaKey, (_event, apiKey) =>
     controller.importOpenSeaKey(asString(apiKey)),

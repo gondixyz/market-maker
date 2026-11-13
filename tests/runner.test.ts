@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 
-import { Runner } from '../src/engine/runner';
+import { type RoundReport, Runner } from '../src/engine/runner';
 import { VenueMarket } from '../src/engine/venueMarket';
 import { bidOf, eth, FakeMarket, listingTaskJson, tasksFileOf } from './fakeMarket';
 
@@ -102,6 +102,7 @@ describe('Runner', () => {
       status: 'bidding',
       bidId: '102',
       price: eth('9'),
+      offers: 1,
     });
   });
 
@@ -167,6 +168,28 @@ describe('Runner', () => {
 
     expect(market.placed).toHaveLength(1);
     expect(runner.states().get('second')).toEqual({ status: 'waiting', reason: 'exposureLimit' });
+  });
+
+  test('counts a ladder as its top offer against the exposure limit', async () => {
+    const market = new FakeMarket();
+    const ladder = task('ladder', { ladder: { offers: 3, spacing: '0.5' } });
+    const second = task('second', { collection: 'boredapeyachtclub' });
+    const runner = runnerFor(market, [ladder, second], { exposureLimit: '16.02' });
+
+    await runner.round();
+
+    expect(market.placed.map((bid) => bid.price)).toEqual([
+      eth('8.01'),
+      eth('8'),
+      eth('7.5'),
+      eth('8.01'),
+    ]);
+    expect(runner.states().get('ladder')).toEqual({
+      status: 'bidding',
+      bidId: '100',
+      price: eth('8.01'),
+      offers: 3,
+    });
   });
 
   test('counts an offer a wait leaves up against the exposure limit of the other tasks', async () => {
@@ -311,6 +334,64 @@ const underwaterBuy = (timestamp: Date) => ({
   side: 'buy' as const,
   price: eth('10.45'),
   timestamp,
+});
+
+describe('Runner with wrapEth', () => {
+  const WRAP = { exposureLimit: '9', wrapEth: { keepEth: '0.05' } };
+
+  test("wraps the ETH a sale paid before bidding, so the round's bid has the WETH", async () => {
+    const market = new FakeMarket();
+    market.market = { ...market.market, balance: 0n };
+    market.balances = { eth: eth('10'), weth: 0n, pending: false };
+    const runner = runnerFor(market, [task('punks')], WRAP);
+    const wraps: unknown[] = [];
+    runner.on('wrap', (report) => wraps.push(report));
+
+    await runner.round();
+
+    expect(market.wrapped).toEqual([eth('9')]);
+    expect(wraps).toEqual([{ status: 'wrapped', amount: eth('9') }]);
+    expect(market.placed).toHaveLength(1);
+  });
+
+  test('wraps nothing without wrapEth', async () => {
+    const market = new FakeMarket();
+    market.balances = { eth: eth('10'), weth: 0n, pending: false };
+
+    await runnerFor(market, [task('punks')]).round();
+
+    expect(market.wrapped).toEqual([]);
+  });
+
+  test('reports a failed wrap and bids on', async () => {
+    const market = new FakeMarket();
+    market.balances = { eth: eth('10'), weth: 0n, pending: false };
+    market.failWrap = true;
+    const runner = runnerFor(market, [task('punks')], WRAP);
+    const wraps: unknown[] = [];
+    runner.on('wrap', (report) => wraps.push(report));
+
+    await runner.round();
+
+    expect(wraps).toEqual([{ status: 'failed', error: 'Error: timed out' }]);
+    expect(market.placed).toHaveLength(1);
+  });
+
+  test('wraps nothing more while a wrap that timed out is still unmined', async () => {
+    const market = new FakeMarket();
+    market.balances = { eth: eth('10'), weth: 0n, pending: false };
+    market.failWrap = true;
+    const runner = runnerFor(market, [task('punks')], WRAP);
+    const wraps: unknown[] = [];
+    runner.on('wrap', (report) => wraps.push(report));
+    await runner.round();
+    market.failWrap = false;
+
+    await runner.round();
+
+    expect(wraps).toEqual([{ status: 'failed', error: 'Error: timed out' }]);
+    expect(market.wrapped).toEqual([]);
+  });
 });
 
 describe('Runner with loss limits', () => {
@@ -495,6 +576,19 @@ describe('Runner with listings', () => {
       status: 'waiting',
       reason: 'needsOnChainCancel',
     });
+  });
+
+  test('reports the listing it leaves up while it waits for an on-chain cancel', async () => {
+    const market = new FakeMarket();
+    const runner = runnerFor(market, [listingTaskJson()]);
+    const reports: RoundReport[] = [];
+    runner.on('round', (report) => reports.push(report));
+    await runner.round();
+    market.listingBook.lowestCompetingAsk = eth('11');
+
+    await runner.round();
+
+    expect(reports.at(-1)?.tasks[0].orders.map((order) => order.price)).toEqual([eth('9.99')]);
   });
 
   test('halts once the listing fills', async () => {

@@ -11,7 +11,7 @@ guide then covers only what is specific to the bot. Standalone, this guide is th
 ## Commands
 
 - Install: `bun install`
-- Run: `bun start run <tasks.json>` (see `README.md`)
+- Run: `bun start run <tasks.json>` (see `docs/command-line.md`)
 - Lint: `bun run lint` (prettier check, eslint, `tsc --noEmit`)
 - Test: `bun run test`
 - Desktop: `bun run dev:desktop` (Electron with hot reload), `bun run build:desktop` (into `out/`),
@@ -21,17 +21,18 @@ guide then covers only what is specific to the bot. Standalone, this guide is th
 ## Releases
 
 This package is mirrored to the public https://github.com/gondixyz/market-maker, whose own
-workflows (`.github/workflows/`, inert inside a wider repository) check every PR and turn a tag
-into a release:
+workflows (`.github/workflows/`, inert inside a wider repository) check every PR and release each
+new version:
 
 1. Bump `version` in `package.json` in a PR that adds its `# <version>` section to the top of
    `CHANGELOG.md`, and merge it. The section is written for the app's users: what they can now do
    or no longer hit, not how. A check fails a version bump without one.
-2. Sync the mirror and merge its PR (the wider repository's guide says how).
-3. Tag the mirror's merged commit `v<version>` and push the tag. `release.yml` checks the tag
-   against `package.json`, runs `verify`, builds the macOS DMGs and the Windows installer on
-   their own runners, and publishes them as the tag's release, whose notes are the version's
-   `CHANGELOG.md` section followed by `.github/release-notes.md`.
+2. Sync the mirror and merge its PR (the wider repository's guide says how). That push to `main`
+   finds no `v<version>` tag, so `release.yml` runs `verify`, builds the macOS DMGs and the Windows
+   installer on their own runners, and publishes them as the release `v<version>`, tagging the
+   pushed commit, with the version's `CHANGELOG.md` section followed by
+   `.github/release-notes.md` as its notes. A push that leaves the version alone releases nothing;
+   a failed release is retried by re-running it, or with the workflow's manual dispatch.
 
 The installers are ad-hoc signed (macOS) or unsigned (Windows), not notarized; the release notes
 and the README's "Download" say how to open them.
@@ -49,9 +50,11 @@ and the README's "Download" say how to open them.
 
 ## Rules
 
-- **The engine never sends a transaction.** Automatic actions are limited to signing orders and
-  cancelling bids off-chain. Anything that costs gas (approvals, on-chain cancels) is an explicit
-  user command. `Market.cancelBids` throws rather than fall back to an on-chain cancel.
+- **The engine sends one transaction, and only when told to.** Automatic actions are limited to
+  signing orders, cancelling bids off-chain and, with the tasks file's `wrapEth`, wrapping ETH into
+  WETH (`Market.wrapEth`), which a listing's ETH sale leaves the bids short of. Anything else that
+  costs gas (approvals, on-chain cancels) is an explicit user command. `Market.cancelBids` throws
+  rather than fall back to an on-chain cancel. The desktop app drops `wrapEth` in `createRunner`.
 - **Listings are never cancelled by the bot.** They cancel only on-chain, so repricing down lists
   again and leaves the older listing to expire, and repricing up waits for the user
   (`needsOnChainCancel`). Listings never count against `exposureLimit`, which caps bids only.

@@ -19,6 +19,7 @@ import {
 } from './pnl';
 import { type HaltReason, reconcile, remaining, type WaitReason } from './reconcile';
 import type { BidTask, ListingTask, LossLimits, Task, TasksFile } from './task';
+import { wrapAmount } from './wrap';
 
 /** What one listed item shows. */
 export type ListingItemState =
@@ -28,7 +29,8 @@ export type ListingItemState =
 
 export type TaskState =
   | { status: 'starting' }
-  | { status: 'bidding'; bidId: string; price: bigint }
+  /** `bidId` and `price` are the top offer's; `offers` counts every live one. */
+  | { status: 'bidding'; bidId: string; price: bigint; offers: number }
   | { status: 'listing'; listingId: number; price: bigint }
   | { status: 'listingInventory'; items: { tokenId: bigint; state: ListingItemState }[] }
   | { status: 'waiting'; reason: WaitReason | ListingWaitReason }
@@ -51,7 +53,7 @@ type TaskRun<RunTask extends Task = Task> = {
   task: RunTask;
   state: TaskState;
   referenceFloor: bigint | null;
-  /** What the task's live bids commit: each one's price times what it has left to buy. */
+  /** What the task's live bids commit: see `commitmentOf`. */
   commitment: bigint;
   /** The floor and the items held as the task's latest bid snapshot read them; `null` before one. */
   floorPrice: bigint | null;
@@ -65,6 +67,11 @@ type TaskRun<RunTask extends Task = Task> = {
 
 /** One task as a round left it. */
 export type TaskReport = TaskRun;
+
+/** What a round's `wrapEth` top-up did: wrapped `amount` wei of ETH, or failed with `error`. */
+export type WrapReport =
+  | { status: 'wrapped'; amount: bigint }
+  | { status: 'failed'; error: string };
 
 /** What a round saw and did, emitted as `round` once every task has advanced. */
 export type RoundReport = {
@@ -85,6 +92,7 @@ type RunnerEvents = {
   state: [taskId: string, state: TaskState];
   loss: [report: LossReport];
   round: [report: RoundReport];
+  wrap: [report: WrapReport];
 };
 
 /** How long a measured loss stands in for a read that fails, before bidding stops. */
@@ -125,6 +133,20 @@ const listingOrder = (listing: OwnListing, tokenId: bigint): LiveOrder => ({
   expiration: listing.expiration,
 });
 
+/**
+ * What a task's live bids commit against `exposureLimit`: the highest price times the most any one
+ * may still buy. A ladder's offers share the top offer's WETH, and so do the leftovers of a task
+ * that replaced its offer while the marketplace would not cancel the old one yet.
+ */
+const commitmentOf = (bids: OwnBid[]) => {
+  const highestPrice = bids.reduce(
+    (highest, bid) => (bid.price > highest ? bid.price : highest),
+    0n,
+  );
+  const mostRemaining = Math.max(0, ...bids.map(remaining));
+  return highestPrice * BigInt(mostRemaining);
+};
+
 const isBidRun = (run: TaskRun): run is TaskRun<BidTask> => run.task.kind !== 'listing';
 const isListingRun = (run: TaskRun): run is TaskRun<ListingTask> => run.task.kind === 'listing';
 
@@ -133,6 +155,9 @@ const isListingRun = (run: TaskRun): run is TaskRun<ListingTask> => run.task.kin
  * every task that is not halted, in order (a disabled task starts halted and never runs), and carries out its `reconcile` decision. Tasks run one
  * after another rather than concurrently, so the exposure each one sees already counts the bids the
  * earlier ones placed this round.
+ *
+ * With `wrapEth`, each round, once the loss is measured and before any task advances, wraps ETH
+ * into WETH when the bids are short of it (`topUpWeth`).
  *
  * With `lossLimits`, each round first measures the wallet's loss from its fills and emits it as
  * `loss`; while it is at a cap, or cannot be measured, every bid task withdraws its bids and waits
@@ -208,6 +233,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
   async round() {
     const startedAt = this.now();
     const { loss, pnl } = await this.reportLoss();
+    await this.topUpWeth();
     for (const run of this.runs) {
       if (isBidRun(run) && !run.task.enabled) await this.countLeftBids(run);
     }
@@ -346,6 +372,33 @@ export class Runner extends EventEmitter<RunnerEvents> {
     return [...this.fillsRead.values()];
   }
 
+  /**
+   * With `wrapEth`, wraps the ETH `wrapAmount` decides before any bid is placed, so the round's
+   * bids see the WETH it adds, and emits what it did as `wrap`. A failure is reported and the
+   * round goes on: the bids then wait on the WETH they lack, as they would without `wrapEth`.
+   * Nothing is wrapped while the wallet has a transaction unmined, such as a wrap that timed out,
+   * since the balances do not count it yet and a second wrap would double it.
+   */
+  private async topUpWeth() {
+    const settings = this.file.wrapEth;
+    if (!settings) return;
+    try {
+      const { eth, weth, pending } = await this.market.walletBalances();
+      if (pending) return;
+      const amount = wrapAmount({
+        eth,
+        weth,
+        target: this.file.exposureLimit,
+        keepEth: settings.keepEth,
+      });
+      if (amount === 0n) return;
+      await this.market.wrapEth(amount);
+      this.emit('wrap', { status: 'wrapped', amount });
+    } catch (error) {
+      this.emit('wrap', { status: 'failed', error: String(error) });
+    }
+  }
+
   private async advance(run: TaskRun, lossLimitReached: boolean) {
     try {
       if (isBidRun(run)) await this.advanceBid(run, lossLimitReached);
@@ -394,21 +447,28 @@ export class Runner extends EventEmitter<RunnerEvents> {
     });
     const cancelled = new Set(decision.cancel.map((bid) => bid.id));
     const leftUp = snapshot.ownBids.filter((bid) => bid.active && !cancelled.has(bid.id));
-    if (decision.type === 'place') {
-      const bid = await this.market.placeBid({
-        scope: scopeOf(run.task),
-        price: decision.price,
-        quantity: decision.quantity,
-        expiration: new Date(this.now().getTime() + run.task.expirationMinutes * 60_000),
-      });
-      leftUp.push(bid);
+    const placements = decision.type === 'bid' ? decision.place : [];
+    for (const { price, quantity } of placements) {
+      leftUp.push(
+        await this.market.placeBid({
+          scope: scopeOf(run.task),
+          price,
+          quantity,
+          expiration: new Date(this.now().getTime() + run.task.expirationMinutes * 60_000),
+        }),
+      );
       this.book(run, leftUp);
-      this.update(run, { status: 'bidding', bidId: bid.id, price: bid.price });
     }
     if (decision.cancel.length > 0) await this.market.cancelBids(decision.cancel);
-    if (decision.type !== 'place') this.book(run, leftUp);
-    if (decision.type === 'keep') {
-      this.update(run, { status: 'bidding', bidId: decision.bid.id, price: decision.bid.price });
+    this.book(run, leftUp);
+    if (decision.type === 'bid' && leftUp.length > 0) {
+      const top = leftUp.reduce((best, bid) => (bid.price > best.price ? bid : best));
+      this.update(run, {
+        status: 'bidding',
+        bidId: top.id,
+        price: top.price,
+        offers: leftUp.length,
+      });
     }
     if (decision.type === 'wait') this.update(run, { status: 'waiting', reason: decision.reason });
     if (decision.type === 'halt') this.update(run, { status: 'halted', reason: decision.reason });
@@ -420,7 +480,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
    * a kept bid, and still counts against `exposureLimit` for every other task.
    */
   private book(run: TaskRun, bids: OwnBid[]) {
-    run.commitment = bids.reduce((total, bid) => total + bid.price * BigInt(remaining(bid)), 0n);
+    run.commitment = commitmentOf(bids);
     run.orders = bids.map(bidOrder);
   }
 
@@ -477,7 +537,10 @@ export class Runner extends EventEmitter<RunnerEvents> {
     this.update(run, { status: 'listingInventory', items });
   }
 
-  /** Carries out a listing decision for one item: what the item shows, and its live listing. */
+  /**
+   * Carries out a listing decision for one item: what the item shows, and its live listing, which a
+   * `needsOnChainCancel` wait still leaves up.
+   */
   private async carryOutListing(
     task: ListingTask,
     scope: ListingScope,
@@ -487,7 +550,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
     listing: OwnListing | undefined;
   }> {
     if (decision.type === 'wait') {
-      return { state: { status: 'waiting', reason: decision.reason }, listing: undefined };
+      return { state: { status: 'waiting', reason: decision.reason }, listing: decision.listing };
     }
     const listing =
       decision.type === 'keep'

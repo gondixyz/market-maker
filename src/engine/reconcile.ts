@@ -1,6 +1,6 @@
 import { isCrossed } from './listing';
 import type { BidSnapshot, OwnBid } from './market';
-import { targetBidPrice } from './pricing';
+import { ladderPrices } from './pricing';
 import type { BidTask } from './task';
 
 const MINIMUM_REFRESH_MARGIN_MS = 2 * 60_000;
@@ -16,13 +16,16 @@ export type WaitReason =
   | 'lossLimit'
   | 'crossedBook';
 
+/** An offer to place: its price and how many items it may buy. */
+export type Placement = { price: bigint; quantity: number };
+
 /**
  * What to do with a task's bids this round. Every variant names the wallet's bids to cancel, so a
  * decision is carried out the same way whatever it is: place first (when it places), then cancel.
+ * A `bid` keeps the task's offers that already sit where they should and places the missing ones.
  */
 export type Decision = { cancel: OwnBid[] } & (
-  | { type: 'keep'; bid: OwnBid }
-  | { type: 'place'; price: bigint; quantity: number }
+  | { type: 'bid'; keep: OwnBid[]; place: Placement[] }
   | { type: 'wait'; reason: WaitReason }
   | { type: 'halt'; reason: HaltReason }
 );
@@ -109,6 +112,39 @@ const needsRefresh = (bid: OwnBid, task: BidTask, now: Date) => {
 };
 
 /**
+ * The `bid` decision for offers at `prices`, each for `quantity` items: each price keeps the newest
+ * active bid at it for that quantity that is not near expiry, and places one otherwise; every other
+ * active bid is cancelled. While one of those the marketplace will not cancel yet is up, nothing is
+ * placed: the task keeps it beside the matched bids and cancels only what it can.
+ */
+const bidDecision = (
+  prices: bigint[],
+  quantity: number,
+  activeBids: OwnBid[],
+  task: BidTask,
+  now: Date,
+): Decision => {
+  const newestFirst = [...activeBids].sort(byNewest);
+  const keep = prices.flatMap(
+    (price) =>
+      newestFirst.find(
+        (bid) =>
+          bid.price === price && remaining(bid) === quantity && !needsRefresh(bid, task, now),
+      ) ?? [],
+  );
+  const offLadder = activeBids.filter((bid) => !keep.includes(bid));
+  const withdrawable = cancellableAt(offLadder, now);
+  if (withdrawable.length < offLadder.length) {
+    const locked = offLadder.filter((bid) => !withdrawable.includes(bid));
+    return { type: 'bid', keep: [...keep, ...locked], place: [], cancel: withdrawable };
+  }
+  const place = prices
+    .filter((price) => !keep.some((bid) => bid.price === price))
+    .map((price) => ({ price, quantity }));
+  return { type: 'bid', keep, place, cancel: offLadder };
+};
+
+/**
  * Decides what a task does with its bids this round, from one snapshot. Pure: the runner carries
  * the decision out. Buying the whole `quantity` or a floor move halts the task; with `maxItems` or
  * `maxHeldValue` a fill does not, and the task withdraws its bid only while the wallet holds that
@@ -117,10 +153,12 @@ const needsRefresh = (bid: OwnBid, task: BidTask, now: Date) => {
  * under the best competing bid (`crossedBook`), as a dust floor would have it value held items at
  * nothing and cap the bid at nothing; a crossed floor never counts as a floor move. A bid
  * that cannot be priced or paid for is withdrawn rather than left at a stale price; otherwise the
- * task keeps exactly one active bid at its target price for what it still wants to buy, replaced
- * when either changes or the bid nears expiry. A bid the marketplace will not cancel yet
- * (`cancellableFrom`) is left up: while one is, the task keeps its newest bid instead of placing
- * another beside it, and a wait cancels only the bids it can, so a later round withdraws the rest.
+ * task keeps exactly one active bid per `ladderPrices` price (one without a `ladder`) for what it
+ * still wants to buy, replaced when either changes or the bid nears expiry. The quantity, balance
+ * and exposure checks price the top offer alone, as the offers share its WETH. A bid the
+ * marketplace will not cancel yet (`cancellableFrom`) is left up: while one is off the ladder, the
+ * task places nothing beside it, and a wait cancels only the bids it can, so a later round
+ * withdraws the rest.
  * A halt still names every active bid, since a halted task gets no later round to withdraw them.
  */
 export const reconcile = ({
@@ -145,7 +183,8 @@ export const reconcile = ({
   }
   if (lossLimitReached) return { type: 'wait', reason: 'lossLimit', cancel: withdrawable };
   if (wanted <= 0) return { type: 'wait', reason: 'maxItemsHeld', cancel: withdrawable };
-  const price = targetBidPrice(task, snapshot);
+  const prices = ladderPrices(task, snapshot);
+  const price = prices.at(0) ?? null;
   const quantity =
     price === null || task.maxHeldValue === undefined
       ? wanted
@@ -156,11 +195,5 @@ export const reconcile = ({
   if (quantity <= 0) return { type: 'wait', reason: 'maxHeldValue', cancel: withdrawable };
   const reason = waitReason(price * BigInt(quantity), snapshot, exposureAvailable);
   if (reason) return { type: 'wait', reason, cancel: withdrawable };
-  const [newest, ...older] = [...activeBids].sort(byNewest);
-  const atTarget =
-    newest?.price === price && remaining(newest) === quantity && !needsRefresh(newest, task, now);
-  if (newest && (atTarget || withdrawable.length < activeBids.length)) {
-    return { type: 'keep', bid: newest, cancel: cancellableAt(older, now) };
-  }
-  return { type: 'place', price, quantity, cancel: activeBids };
+  return bidDecision(prices, quantity, activeBids, task, now);
 };

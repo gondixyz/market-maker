@@ -4,7 +4,11 @@
  * `fileOf` writes it back as the JSON main validates; main's schema stays the only validation.
  */
 
+import { parseEther } from 'viem';
+
 import { type Venue, VENUES } from '../../engine/market';
+import { BID_EXPIRATION_MINUTES, LISTING_EXPIRATION_MINUTES } from '../../engine/task';
+import type { CollectionPricing } from '../api';
 
 export type BidPricingMode =
   | 'outbid'
@@ -28,6 +32,8 @@ export type TaskForm = {
   percent: string;
   steps: string;
   level: string;
+  /** How far under the cheapest other listing an undercut listing asks, in ETH. */
+  amount: string;
   minPrice: string;
   maxPrice: string;
   expirationMinutes: string;
@@ -71,6 +77,10 @@ const idOf = (kind: TaskForm['kind'], takenIds: string[]) => {
   return `${prefix}-${number}`;
 };
 
+/** What `expirationMinutes` of a task of `kind` defaults to, as the tasks file schema has it. */
+export const defaultExpirationOf = (kind: TaskForm['kind']) =>
+  String(kind === 'listing' ? LISTING_EXPIRATION_MINUTES : BID_EXPIRATION_MINUTES);
+
 /** A new task of `kind`, given the first `bid-<n>` or `listing-<n>` id none of `takenIds` uses. */
 export const newTask = (kind: TaskForm['kind'], takenIds: string[]): TaskForm => ({
   id: idOf(kind, takenIds),
@@ -83,9 +93,10 @@ export const newTask = (kind: TaskForm['kind'], takenIds: string[]): TaskForm =>
   percent: '',
   steps: '1',
   level: '5',
+  amount: '',
   minPrice: '',
   maxPrice: '',
-  expirationMinutes: '60',
+  expirationMinutes: defaultExpirationOf(kind),
   quantity: '1',
   maxItems: '',
   maxHeldValue: '',
@@ -117,9 +128,10 @@ const taskFormOf = (raw: unknown): TaskForm => {
     percent: textOf(pricing.percent),
     steps: textOf(pricing.steps) || '1',
     level: textOf(pricing.level) || '5',
+    amount: textOf(pricing.amount),
     minPrice: textOf(task.minPrice),
     maxPrice: textOf(task.maxPrice),
-    expirationMinutes: textOf(task.expirationMinutes) || '60',
+    expirationMinutes: textOf(task.expirationMinutes) || defaultExpirationOf(kind),
     quantity: textOf(task.quantity) || '1',
     maxItems: textOf(task.maxItems),
     maxHeldValue: textOf(task.maxHeldValue),
@@ -184,7 +196,7 @@ const pricingOf = (task: TaskForm): Json => {
     case 'outbid':
       return { mode: 'outbid', steps: numberOf(task.steps) };
     case 'undercut':
-      return { mode: 'undercut', steps: numberOf(task.steps) };
+      return withoutEmpty({ mode: 'undercut', amount: task.amount.trim() });
     case 'level':
       return { mode: 'level', level: numberOf(task.level) };
   }
@@ -256,10 +268,62 @@ const pricingSummaryOf = (task: TaskForm, unit: string) => {
     case 'outbid':
       return `Outbid by ${plural(task.steps, 'step')}`;
     case 'undercut':
-      return `Undercut by ${plural(task.steps, 'step')}`;
+      return `Undercut by ${task.amount || '?'} ${unit}`;
     case 'level':
       return `Bid level ${task.level || '?'}`;
   }
+};
+
+/** A price move above this share of the floor, in percent, makes a rule overshoot the market. */
+const FLOOR_SHARE_WARNING_PERCENT = 20n;
+
+/** `amount` as a whole percentage of `floor`, when it is over `FLOOR_SHARE_WARNING_PERCENT`. */
+const floorShareOver = (amount: bigint, floor: bigint) =>
+  floor > 0n && amount * 100n > floor * FLOOR_SHARE_WARNING_PERCENT
+    ? ((amount * 100n) / floor).toLocaleString('en-US')
+    : null;
+
+/** An amount the tasks file reads as ETH, such as "0.0001". */
+const ETH_AMOUNT = /^\d+(\.\d{1,18})?$/;
+
+/** What a step-priced rule does when one step is a large share of the floor, by pricing mode. */
+const STEP_CONSEQUENCES: Partial<Record<TaskForm['pricingMode'], (steps: string) => string>> = {
+  outbid: (steps) => `Outbidding by ${steps} can bid far above the best bid, up to your max price.`,
+  outbidPercent: () =>
+    'Outbidding by a percentage still raises the best bid by at least one step, up to your max price.',
+  floorSteps: (steps) =>
+    `Bidding ${steps} under the floor can bid far below it, or your min price when it lands under that.`,
+};
+
+/**
+ * The warning the editor shows when bid `task` prices in steps and one step of its collection is
+ * more than `FLOOR_SHARE_WARNING_PERCENT` of the floor; `null` otherwise, and without a floor.
+ */
+export const stepWarningOf = (task: TaskForm, { priceStep, floor }: CollectionPricing) => {
+  const consequence = STEP_CONSEQUENCES[task.pricingMode];
+  if (!consequence || floor === null) return null;
+  const percent = floorShareOver(parseEther(priceStep), parseEther(floor));
+  if (percent === null) return null;
+  return (
+    `One price step (${priceStep} WETH) is ${percent}% of the floor (${floor} ETH). ` +
+    consequence(plural(task.steps, 'step'))
+  );
+};
+
+/**
+ * The warning the editor shows when undercut listing `task` asks more than
+ * `FLOOR_SHARE_WARNING_PERCENT` of the floor under the cheapest listing; `null` otherwise, without
+ * a floor, or while the amount is not one yet.
+ */
+export const undercutWarningOf = (task: TaskForm, { floor }: CollectionPricing) => {
+  const amount = task.amount.trim();
+  if (task.pricingMode !== 'undercut' || floor === null || !ETH_AMOUNT.test(amount)) return null;
+  const percent = floorShareOver(parseEther(amount), parseEther(floor));
+  if (percent === null) return null;
+  return (
+    `Your undercut (${amount} ETH) is ${percent}% of the floor (${floor} ETH). ` +
+    'It can ask far under the floor, or your min price when it lands under that.'
+  );
 };
 
 /** One line saying how a collapsed task prices: its rule, then its price limits. */
@@ -322,7 +386,7 @@ export const positionsWithErrors = (errors: Map<string, string>) =>
     }),
   );
 
-const PRICING_FIELDS = new Set(['price', 'percent', 'steps', 'level']);
+const PRICING_FIELDS = new Set(['price', 'percent', 'steps', 'level', 'amount']);
 
 /**
  * Main's errors (`<path>: <message>`, the path dotted as zod reports it) keyed by the form field

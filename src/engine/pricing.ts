@@ -79,3 +79,23 @@ export const targetBidPrice = (task: BidTask, snapshot: BidSnapshot): bigint | n
   const stepped = floorToStep(rulePrice, snapshot.priceStep);
   return stepped < lowest ? lowest : stepped > highest ? highest : stepped;
 };
+
+/**
+ * The prices a task's offers should sit at now, best first: the `targetBidPrice` and, with a
+ * `ladder`, its other offers on the highest multiples of `spacing` strictly below it, rounded down
+ * onto the price step, without repeats and none under `minPrice`. Lower offers stay on the same
+ * grid while the top price moves within one spacing, so such a move replaces only the top offer.
+ * Empty when there is no target price.
+ */
+export const ladderPrices = (task: BidTask, snapshot: BidSnapshot): bigint[] => {
+  const top = targetBidPrice(task, snapshot);
+  if (top === null) return [];
+  if (!task.ladder) return [top];
+  const { offers, spacing } = task.ladder;
+  const highestBelowTop = top - 1n - ((top - 1n) % spacing);
+  const lowest = ceilToStep(task.minPrice, snapshot.priceStep);
+  const lower = Array.from({ length: offers - 1 }, (_, index) =>
+    floorToStep(highestBelowTop - BigInt(index) * spacing, snapshot.priceStep),
+  ).filter((price) => price > 0n && price >= lowest && price < top);
+  return [top, ...new Set(lower)];
+};

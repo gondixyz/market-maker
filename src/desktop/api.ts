@@ -29,11 +29,29 @@ export type DesktopStatus = {
 /** The bot wallet's balances, in ETH as decimal strings. */
 export type WalletBalances = { eth: string; weth: string };
 
+/**
+ * How much WETH a venue's spender may still spend: `unlimited` for the maximum approval, which
+ * WETH never draws down, else what is left, in ETH as a decimal string, which each fill lowers.
+ */
+export type WethAllowance = { kind: 'unlimited' } | { kind: 'limited'; weth: string };
+
 /** The wallet's public GONDI profile; `picture` is a `data:` URL, inlined by main. */
 export type WalletProfile = { name: string | null; picture: string | null };
 
 /** A collection the tasks' collection picker offers; `image` is a `data:` URL, inlined by main. */
 export type CollectionOption = { slug: string; name: string; image: string | null };
+
+/**
+ * What the strategy editor shows about pricing a collection on a venue, in ETH as decimal strings:
+ * the smallest price increment the venue takes (`0` when it has none), the collection's floor, its
+ * cheapest ETH or WETH listing, and its top bid, the highest WETH collection bid (each `null` when
+ * there is none; the top bid `undefined` when it could not be read).
+ */
+export type CollectionPricing = {
+  priceStep: string;
+  floor: string | null;
+  topBid: string | null | undefined;
+};
 
 /** A saved file may still carry warnings, such as a listing that could sell under a bid's ceiling. */
 export type SaveTasksResult = { ok: true; warnings: string[] } | { ok: false; errors: string[] };
@@ -44,9 +62,11 @@ export type CancelListingsResult =
   | { outcome: 'declined' }
   | { outcome: 'cancelled'; count: number; transactionHashes: string[] };
 
-export type ApprovalResult =
-  | { outcome: 'approved'; transactionHash: string }
-  | { outcome: 'declined' };
+/** How an approval went: declined at the dialog, or sent, for `approvalMined` to wait on. */
+export type ApprovalResult = { outcome: 'sent'; transactionHash: string } | { outcome: 'declined' };
+
+/** How a collection approval went: already in place (nothing asked or sent), declined, or sent. */
+export type CollectionApprovalResult = ApprovalResult | { outcome: 'alreadyApproved' };
 
 /** The only calls the window can make into main; `preload` exposes exactly these. */
 export interface DesktopApi {
@@ -60,6 +80,19 @@ export interface DesktopApi {
   cancelAll(): Promise<DesktopStatus>;
   /** Lets the venue's spender (Seaport, or OpenSea's conduit) spend `amount` WETH, once confirmed. */
   approveWeth(amount: string, venue: Venue): Promise<ApprovalResult>;
+  /** Lets the venue's spender spend any amount of WETH, with no limit, once confirmed. */
+  approveUnlimitedWeth(venue: Venue): Promise<ApprovalResult>;
+  /**
+   * Resolves once the approval this session sent as `transactionHash` is mined; rejects if it
+   * reverts, or if no such approval is pending.
+   */
+  approvalMined(transactionHash: string): Promise<void>;
+  /**
+   * Lets the operator GONDI listings of the `slug` collection fill through (Seaport, or the
+   * collection's Seaport conduit) move its items, once confirmed; asks nothing when it already may.
+   * A sent approval is waited on with `approvalMined`, like a WETH one.
+   */
+  approveCollection(slug: string): Promise<CollectionApprovalResult>;
   /**
    * Cancels, on-chain and once confirmed, every active GONDI listing of the strategies'
    * collections; stops the bot first, so it does not list them again.
@@ -76,10 +109,17 @@ export interface DesktopApi {
   removeRpcUrl(): Promise<DesktopStatus>;
   /** The stored key's wallet balances; rejects without a key. */
   balances(): Promise<WalletBalances>;
+  /** What each venue's spender may currently spend of the stored key's WETH; rejects without a key. */
+  allowances(): Promise<Record<Venue, WethAllowance>>;
   /** The collections the tasks' collection picker offers, most traded first. */
   collections(): Promise<CollectionOption[]>;
   /** The pickable collections whose name or slug `query` matches, most traded first. */
   searchCollections(query: string): Promise<CollectionOption[]>;
+  /**
+   * The `slug` collection's price step on `venue`, its floor and its top bid; rejects for one GONDI
+   * does not know.
+   */
+  collectionPricing(slug: string, venue: Venue): Promise<CollectionPricing>;
   /** The stored key's wallet's GONDI name and picture; rejects without a key. */
   profile(): Promise<WalletProfile>;
   onStatus(listener: (status: DesktopStatus) => void): () => void;
@@ -96,15 +136,20 @@ export const INVOKE_CHANNELS = {
   stop: 'market-maker:stop',
   cancelAll: 'market-maker:cancel-all',
   approveWeth: 'market-maker:approve-weth',
+  approveUnlimitedWeth: 'market-maker:approve-unlimited-weth',
+  approvalMined: 'market-maker:approval-mined',
+  approveCollection: 'market-maker:approve-collection',
   cancelAllListings: 'market-maker:cancel-all-listings',
   importOpenSeaKey: 'market-maker:import-opensea-key',
   removeOpenSeaKey: 'market-maker:remove-opensea-key',
   saveRpcUrl: 'market-maker:save-rpc-url',
   removeRpcUrl: 'market-maker:remove-rpc-url',
   balances: 'market-maker:balances',
+  allowances: 'market-maker:allowances',
   profile: 'market-maker:profile',
   collections: 'market-maker:collections',
   searchCollections: 'market-maker:search-collections',
+  collectionPricing: 'market-maker:collection-pricing',
 } as const satisfies Record<Exclude<keyof DesktopApi, 'onStatus'>, string>;
 
 /** Main pushes a fresh `DesktopStatus` on this channel whenever a task changes state. */

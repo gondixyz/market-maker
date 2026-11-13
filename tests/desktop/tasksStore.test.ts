@@ -48,7 +48,7 @@ describe('TasksStore', () => {
       id: 'sell',
       kind: 'listing',
       collection: 'pudgypenguins',
-      pricing: { mode: 'undercut' },
+      pricing: { mode: 'undercut', amount: '0.01' },
       minPrice: '2.4',
       maxPrice: '3',
     };
