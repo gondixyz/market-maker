@@ -5,19 +5,6 @@ A non-custodial market-making bot for NFT bids on [GONDI](https://gondi.xyz) and
 bid from the live order book, replaces it when someone outbids you, refreshes it before it expires,
 and stops when a bid fills or the floor moves.
 
-Your private key never leaves your machine. The bot signs orders and cancels bids off-chain, both
-free; it never sends a transaction on its own.
-
-It also keeps your listings competitive: it lists an item against the cheapest other listing in
-its collection, lists again lower when someone undercuts you, and stops when the item sells.
-
-> Status: early. Collection bids and single-item listings on Ethereum, from the command line or a
-> desktop app for macOS and Windows.
-
-**Use at your own risk.** The bot places real bids with the funds of the wallet you give it, and a
-filled bid is a real purchase. It comes with no warranty (see `LICENSE`): start with a dedicated
-wallet and small limits, and watch it before you leave it running.
-
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
   <img alt="The desktop app running four strategies: GONDI bids on Pudgy Penguins and Milady, an OpenSea bid on BAYC and a Pudgy Penguins listing" src="docs/screenshot-light.png">
@@ -25,7 +12,7 @@ wallet and small limits, and watch it before you leave it running.
 
 ## Features
 
-- 🏪 **Two marketplaces**: collection bids on GONDI and on OpenSea, listings on GONDI.
+- 🏪 **Multiple marketplaces**: collection bids on GONDI and on OpenSea, listings on GONDI.
 - 🎯 **Bid strategies**: outbid the best bid by a step or a percent, bid a share of the floor or a
   few steps under it, join the Nth price level of the bid book, or hold a fixed price.
 - 🏷️ **Listing strategies**: undercut the cheapest listing by an amount, list at a share of the floor, or at a
@@ -57,6 +44,12 @@ open the app the first time:
 - **Windows**: at "Windows protected your PC", click **More info**, then **Run anyway**.
 
 What changed in each release is in [`CHANGELOG.md`](CHANGELOG.md).
+
+## Disclaimer
+
+**Use at your own risk.** The bot places real bids with the funds of the wallet you give it, and a
+filled bid is a real purchase. It comes with no warranty (see `LICENSE`): start with a dedicated
+wallet and small limits, and watch it before you leave it running.
 
 ## License
 
