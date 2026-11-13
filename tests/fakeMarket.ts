@@ -42,7 +42,6 @@ export const bidOf = (overrides: Partial<OwnBid> = {}): OwnBid => ({
 
 export const listingSnapshotOf = (overrides: Partial<ListingSnapshot> = {}): ListingSnapshot => ({
   lowestCompetingAsk: eth('10'),
-  priceStep: eth('0.01'),
   bestCompetingBid: null,
   ownListings: [],
   owned: true,
@@ -64,7 +63,7 @@ export const listingTaskJson = (overrides: object = {}) => ({
   kind: 'listing',
   collection: 'pudgypenguins',
   tokenId: '3950',
-  pricing: { mode: 'undercut' },
+  pricing: { mode: 'undercut', amount: '0.01' },
   minPrice: '9',
   maxPrice: '12',
   ...overrides,
@@ -110,7 +109,6 @@ export class FakeMarket implements Market {
   cancelled: string[] = [];
   listingBook: ListingMarket = {
     lowestCompetingAsk: eth('10'),
-    priceStep: eth('0.01'),
     bestCompetingBid: null,
     approved: true,
   };
@@ -131,6 +129,12 @@ export class FakeMarket implements Market {
   failFills = false;
   /** The `since` of every read of the wallet's trades, in order. */
   fillsReadSince: Date[] = [];
+  /** The wallet's ETH and WETH, which `wrapEth` moves between, adding to the snapshot's balance too. */
+  balances = { eth: eth('0'), weth: eth('0'), pending: false };
+  /** Every amount wrapped, in order. */
+  wrapped: bigint[] = [];
+  /** Makes every wrap time out unmined, leaving it pending. */
+  failWrap = false;
   private nextId = 100;
   private readonly collectionOfBid = new Map<string, string>();
 
@@ -148,6 +152,24 @@ export class FakeMarket implements Market {
 
   async ethUsdPrice() {
     return this.ethUsd;
+  }
+
+  async walletBalances() {
+    return { ...this.balances };
+  }
+
+  async wrapEth(amount: bigint) {
+    if (this.failWrap) {
+      this.balances = { ...this.balances, pending: true };
+      throw new Error('timed out');
+    }
+    this.wrapped.push(amount);
+    this.balances = {
+      eth: this.balances.eth - amount,
+      weth: this.balances.weth + amount,
+      pending: false,
+    };
+    this.market = { ...this.market, balance: this.market.balance + amount };
   }
 
   async snapshot(scope: BidScope) {

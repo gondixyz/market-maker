@@ -33,10 +33,11 @@ const OFF_CHAIN_CANCEL_DELAY_MS = 330_000;
 const OPENSEA_SIGNED_ZONE: Address = '0x000056f7000000ece9003ca63978907a00ffd100';
 
 /**
- * OpenSea has no price grid, so a step is one wei: outbidding by steps still beats the best offer,
- * and flooring onto the step leaves every other price as it is.
+ * OpenSea takes offers only on a 0.01 WETH grid: it refused a 2.3265 WETH offer with "Bids at this
+ * price are not allowed. Please place a bid in the nearest allowed increment. 2 decimals allowed".
+ * The engine floors a bid onto the step, so an offer never goes above its task's limits.
  */
-export const OPENSEA_PRICE_STEP = 1n;
+export const OPENSEA_PRICE_STEP = 10n ** 16n;
 
 const ERC20_ITEM = 1;
 const PARTIAL_RESTRICTED = 3;

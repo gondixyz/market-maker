@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { reconcile, type ReconcileInput } from '../src/engine/reconcile';
+import { MIN_BID_EXPIRATION_MINUTES } from '../src/engine/task';
 import { bidOf, eth, snapshotOf, taskOf } from './fakeMarket';
 
 const NOW = new Date('2030-01-01T00:00:00Z');
@@ -18,14 +19,20 @@ const decide = (overrides: Partial<ReconcileInput> = {}) =>
 
 describe('reconcile', () => {
   test('places the target bid when the task has none', () => {
-    expect(decide()).toEqual({ type: 'place', price: eth('8.01'), quantity: 1, cancel: [] });
+    expect(decide()).toEqual({
+      type: 'bid',
+      keep: [],
+      place: [{ price: eth('8.01'), quantity: 1 }],
+      cancel: [],
+    });
   });
 
   test('keeps a bid already at the target and far from expiry', () => {
     const bid = bidOf();
     expect(decide({ snapshot: snapshotOf({ ownBids: [bid] }) })).toEqual({
-      type: 'keep',
-      bid,
+      type: 'bid',
+      keep: [bid],
+      place: [],
       cancel: [],
     });
   });
@@ -34,9 +41,9 @@ describe('reconcile', () => {
     const bid = bidOf();
     const snapshot = snapshotOf({ bestCompetingBid: eth('8.5'), ownBids: [bid] });
     expect(decide({ snapshot })).toEqual({
-      type: 'place',
-      price: eth('8.51'),
-      quantity: 1,
+      type: 'bid',
+      keep: [],
+      place: [{ price: eth('8.51'), quantity: 1 }],
       cancel: [bid],
     });
   });
@@ -44,9 +51,9 @@ describe('reconcile', () => {
   test('refreshes a bid close to its expiry', () => {
     const bid = bidOf({ expiration: new Date(NOW.getTime() + 60_000) });
     expect(decide({ snapshot: snapshotOf({ ownBids: [bid] }) })).toEqual({
-      type: 'place',
-      price: eth('8.01'),
-      quantity: 1,
+      type: 'bid',
+      keep: [],
+      place: [{ price: eth('8.01'), quantity: 1 }],
       cancel: [bid],
     });
   });
@@ -55,8 +62,9 @@ describe('reconcile', () => {
     const older = bidOf({ id: '1' });
     const newest = bidOf({ id: '2', placedAt: new Date('2029-12-31T23:59:00Z') });
     expect(decide({ snapshot: snapshotOf({ ownBids: [older, newest] }) })).toEqual({
-      type: 'keep',
-      bid: newest,
+      type: 'bid',
+      keep: [newest],
+      place: [],
       cancel: [older],
     });
   });
@@ -65,8 +73,9 @@ describe('reconcile', () => {
     const older = bidOf({ id: '0xff', placedAt: new Date('2029-12-31T23:00:00Z') });
     const newest = bidOf({ id: '0x01', placedAt: new Date('2029-12-31T23:59:00Z') });
     expect(decide({ snapshot: snapshotOf({ ownBids: [older, newest] }) })).toEqual({
-      type: 'keep',
-      bid: newest,
+      type: 'bid',
+      keep: [newest],
+      place: [],
       cancel: [older],
     });
   });
@@ -85,8 +94,9 @@ describe('reconcile', () => {
     const task = taskOf({ quantity: 3 });
     const bid = bidOf({ maxExecutions: 3, executions: 1 });
     expect(decide({ task, snapshot: snapshotOf({ ownBids: [bid] }) })).toEqual({
-      type: 'keep',
-      bid,
+      type: 'bid',
+      keep: [bid],
+      place: [],
       cancel: [],
     });
   });
@@ -96,9 +106,9 @@ describe('reconcile', () => {
     const bid = bidOf({ maxExecutions: 3, executions: 1 });
     const snapshot = snapshotOf({ bestCompetingBid: eth('8.5'), ownBids: [bid] });
     expect(decide({ task, snapshot })).toEqual({
-      type: 'place',
-      price: eth('8.51'),
-      quantity: 2,
+      type: 'bid',
+      keep: [],
+      place: [{ price: eth('8.51'), quantity: 2 }],
       cancel: [bid],
     });
   });
@@ -121,9 +131,9 @@ describe('reconcile', () => {
     test('keeps bidding after a fill, for what the wallet may still hold', () => {
       const filled = bidOf({ id: '1', active: false, maxExecutions: 2, executions: 2 });
       expect(decide({ task, snapshot: snapshotOf({ ownBids: [filled], held: 2 }) })).toEqual({
-        type: 'place',
-        price: eth('8.01'),
-        quantity: 1,
+        type: 'bid',
+        keep: [],
+        place: [{ price: eth('8.01'), quantity: 1 }],
         cancel: [],
       });
     });
@@ -139,14 +149,14 @@ describe('reconcile', () => {
 
     test('bids again once an item leaves the wallet', () => {
       expect(decide({ task, snapshot: snapshotOf({ held: 2 }) })).toMatchObject({
-        type: 'place',
-        quantity: 1,
+        type: 'bid',
+        place: [{ quantity: 1 }],
       });
     });
 
     test('commits only what it may still buy against the balance', () => {
       expect(decide({ task, snapshot: snapshotOf({ held: 2, balance: eth('8.01') }) }).type).toBe(
-        'place',
+        'bid',
       );
     });
   });
@@ -161,9 +171,8 @@ describe('reconcile', () => {
     ])('%s', (_case, overrides, held, quantity) => {
       const task = taskOf({ quantity: 5, ...overrides });
       expect(decide({ task, snapshot: snapshotOf({ held }) })).toMatchObject({
-        type: 'place',
-        price: eth('8.01'),
-        quantity,
+        type: 'bid',
+        place: [{ price: eth('8.01'), quantity }],
       });
     });
 
@@ -171,9 +180,9 @@ describe('reconcile', () => {
       const task = taskOf({ maxHeldValue: '20' });
       const filled = bidOf({ id: '1', active: false, executions: 1 });
       expect(decide({ task, snapshot: snapshotOf({ ownBids: [filled], held: 1 }) })).toEqual({
-        type: 'place',
-        price: eth('8.01'),
-        quantity: 1,
+        type: 'bid',
+        keep: [],
+        place: [{ price: eth('8.01'), quantity: 1 }],
         cancel: [],
       });
     });
@@ -199,15 +208,15 @@ describe('reconcile', () => {
     test('needs no floor while it holds nothing', () => {
       const task = taskOf({ maxHeldValue: '20' });
       expect(decide({ task, snapshot: snapshotOf({ floorPrice: null }) })).toMatchObject({
-        type: 'place',
-        quantity: 1,
+        type: 'bid',
+        place: [{ quantity: 1 }],
       });
     });
   });
 
   test('halts when the floor moves past the threshold, in either direction', () => {
     const task = taskOf({ haltOnFloorMovePercent: 10 });
-    expect(decide({ task, snapshot: snapshotOf({ floorPrice: eth('11') }) }).type).toBe('place');
+    expect(decide({ task, snapshot: snapshotOf({ floorPrice: eth('11') }) }).type).toBe('bid');
     expect(decide({ task, snapshot: snapshotOf({ floorPrice: eth('11.01') }) })).toMatchObject({
       type: 'halt',
       reason: 'floorMoved',
@@ -289,7 +298,7 @@ describe('reconcile on a crossed book', () => {
     ['no best bid', snapshotOf({ floorPrice: eth('7'), bestCompetingBid: null })],
     ['no floor', snapshotOf({ floorPrice: null, bestCompetingBid: eth('8') })],
   ])('bids as usual with %s', (_case, snapshot) => {
-    expect(decide({ snapshot }).type).toBe('place');
+    expect(decide({ snapshot }).type).toBe('bid');
   });
 });
 
@@ -298,7 +307,7 @@ describe('reconcile with a bid the marketplace will not cancel yet', () => {
 
   test('keeps the bid rather than placing a second one beside it at the new price', () => {
     const snapshot = snapshotOf({ bestCompetingBid: eth('8.5'), ownBids: [recent] });
-    expect(decide({ snapshot })).toEqual({ type: 'keep', bid: recent, cancel: [] });
+    expect(decide({ snapshot })).toEqual({ type: 'bid', keep: [recent], place: [], cancel: [] });
   });
 
   test('withdraws the older duplicates it can and leaves the rest to a later round', () => {
@@ -310,9 +319,27 @@ describe('reconcile with a bid the marketplace will not cancel yet', () => {
     });
     const newest = { ...recent, placedAt: new Date('2029-12-31T23:59:00Z') };
     expect(decide({ snapshot: snapshotOf({ ownBids: [cancellable, locked, newest] }) })).toEqual({
-      type: 'keep',
-      bid: newest,
+      type: 'bid',
+      keep: [newest, locked],
+      place: [],
       cancel: [cancellable],
+    });
+  });
+
+  test('refreshes an OpenSea offer of the shortest bid lifetime before it expires', () => {
+    const placedAt = new Date(NOW.getTime() - (MIN_BID_EXPIRATION_MINUTES - 2) * 60_000);
+    const offer = bidOf({
+      venue: 'opensea',
+      placedAt,
+      cancellableFrom: new Date(placedAt.getTime() + 330_000),
+      expiration: new Date(placedAt.getTime() + MIN_BID_EXPIRATION_MINUTES * 60_000),
+    });
+    const task = taskOf({ expirationMinutes: MIN_BID_EXPIRATION_MINUTES });
+    expect(decide({ task, snapshot: snapshotOf({ ownBids: [offer] }) })).toEqual({
+      type: 'bid',
+      keep: [],
+      place: [{ price: eth('8.01'), quantity: 1 }],
+      cancel: [offer],
     });
   });
 
@@ -331,10 +358,115 @@ describe('reconcile with a bid the marketplace will not cancel yet', () => {
   test('replaces it as usual once it can be cancelled', () => {
     const snapshot = snapshotOf({ bestCompetingBid: eth('8.5'), ownBids: [recent] });
     expect(decide({ snapshot, now: new Date(NOW.getTime() + 60_000) })).toEqual({
-      type: 'place',
-      price: eth('8.51'),
-      quantity: 1,
+      type: 'bid',
+      keep: [],
+      place: [{ price: eth('8.51'), quantity: 1 }],
       cancel: [recent],
+    });
+  });
+});
+
+describe('reconcile a ladder of offers', () => {
+  const task = taskOf({ ladder: { offers: 3, spacing: '0.5' } });
+  const top = bidOf({ id: 'top', price: eth('8.01') });
+  const middle = bidOf({ id: 'middle', price: eth('8') });
+  const bottom = bidOf({ id: 'bottom', price: eth('7.5') });
+
+  test('places every offer of the ladder', () => {
+    expect(decide({ task })).toEqual({
+      type: 'bid',
+      keep: [],
+      place: [
+        { price: eth('8.01'), quantity: 1 },
+        { price: eth('8'), quantity: 1 },
+        { price: eth('7.5'), quantity: 1 },
+      ],
+      cancel: [],
+    });
+  });
+
+  test('keeps every offer already on the ladder', () => {
+    const snapshot = snapshotOf({ ownBids: [bottom, top, middle] });
+    expect(decide({ task, snapshot })).toEqual({
+      type: 'bid',
+      keep: [top, middle, bottom],
+      place: [],
+      cancel: [],
+    });
+  });
+
+  test('replaces only the top offer when the top price moves within one spacing', () => {
+    const snapshot = snapshotOf({ bestCompetingBid: eth('8.2'), ownBids: [top, middle, bottom] });
+    expect(decide({ task, snapshot })).toEqual({
+      type: 'bid',
+      keep: [middle, bottom],
+      place: [{ price: eth('8.21'), quantity: 1 }],
+      cancel: [top],
+    });
+  });
+
+  test('refreshes only the offer close to its expiry', () => {
+    const expiring = { ...bottom, expiration: new Date(NOW.getTime() + 60_000) };
+    const snapshot = snapshotOf({ ownBids: [top, middle, expiring] });
+    expect(decide({ task, snapshot })).toEqual({
+      type: 'bid',
+      keep: [top, middle],
+      place: [{ price: eth('7.5'), quantity: 1 }],
+      cancel: [expiring],
+    });
+  });
+
+  test('replaces every offer when the quantity changes', () => {
+    const ladder = taskOf({ quantity: 2, ladder: { offers: 3, spacing: '0.5' } });
+    const snapshot = snapshotOf({ ownBids: [top, middle, bottom] });
+    expect(decide({ task: ladder, snapshot })).toMatchObject({ type: 'bid', keep: [] });
+    const fresh = [top, middle, bottom].map((bid) => ({ ...bid, maxExecutions: 2 }));
+    expect(decide({ task: ladder, snapshot: snapshotOf({ ownBids: fresh }) })).toMatchObject({
+      type: 'bid',
+      keep: fresh,
+      place: [],
+    });
+  });
+
+  test('checks the balance against the top offer alone', () => {
+    expect(decide({ task, snapshot: snapshotOf({ balance: eth('8.01') }) }).type).toBe('bid');
+    expect(decide({ task, exposureAvailable: eth('8.01') }).type).toBe('bid');
+  });
+
+  test('withdraws every offer on a wait', () => {
+    const snapshot = snapshotOf({ ownBids: [top, middle, bottom] });
+    expect(decide({ task, snapshot, lossLimitReached: true })).toEqual({
+      type: 'wait',
+      reason: 'lossLimit',
+      cancel: [top, middle, bottom],
+    });
+  });
+
+  test('places nothing while an offer off the ladder cannot be cancelled yet', () => {
+    const locked = bidOf({
+      id: 'locked',
+      price: eth('8.01'),
+      cancellableFrom: new Date(NOW.getTime() + 60_000),
+    });
+    const snapshot = snapshotOf({ bestCompetingBid: eth('8.2'), ownBids: [locked, middle] });
+    expect(decide({ task, snapshot })).toEqual({
+      type: 'bid',
+      keep: [middle, locked],
+      place: [],
+      cancel: [],
+    });
+  });
+
+  test('places the rest beside an offer on the ladder that cannot be cancelled yet', () => {
+    const locked = { ...top, cancellableFrom: new Date(NOW.getTime() + 60_000) };
+    expect(decide({ task, snapshot: snapshotOf({ ownBids: [locked] }) })).toEqual({
+      type: 'bid',
+      keep: [locked],
+      place: [
+        { price: eth('8'), quantity: 1 },
+        { price: eth('7.5'), quantity: 1 },
+      ],
+      cancel: [],
     });
   });
 });

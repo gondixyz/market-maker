@@ -22,12 +22,12 @@ export const isCrossed = (ask: bigint | null, bid: bigint | null) =>
 /**
  * What to do with a task's listing this round. Unlike a bid, a listing is never cancelled: that
  * costs a transaction. An older listing a cheaper one replaced stays live, dominated, until it
- * expires.
+ * expires. A `needsOnChainCancel` wait carries the cheaper live listing it leaves up.
  */
 export type ListingDecision =
   | { type: 'keep'; listing: OwnListing }
   | { type: 'place'; price: bigint }
-  | { type: 'wait'; reason: ListingWaitReason }
+  | { type: 'wait'; reason: ListingWaitReason; listing?: OwnListing }
   | { type: 'halt'; reason: 'filled' };
 
 export type DecideListingInput = { task: ListingTask; snapshot: ListingSnapshot; now: Date };
@@ -47,7 +47,7 @@ const ruleListingPrice = (
     case 'undercut':
       return snapshot.lowestCompetingAsk === null
         ? maxPrice
-        : snapshot.lowestCompetingAsk - snapshot.priceStep * BigInt(rule.steps);
+        : snapshot.lowestCompetingAsk - rule.amount;
   }
 };
 
@@ -70,6 +70,13 @@ const needsRefresh = (listing: OwnListing, task: ListingTask, now: Date) => {
   return listing.expiration.getTime() - now.getTime() <= margin;
 };
 
+/**
+ * Whether a buyer can still take the listing. The API can keep an order `Active` long after its
+ * expiration, which Seaport no longer fills, so the expiration decides too.
+ */
+const isLive = (listing: OwnListing, now: Date) =>
+  listing.active && listing.expiration.getTime() > now.getTime();
+
 /** The live listing a buyer would take: the cheapest, and of those the one that lasts longest. */
 const cheapestListing = (listings: OwnListing[]) =>
   [...listings].sort((first, second) =>
@@ -85,7 +92,7 @@ const cheapestListing = (listings: OwnListing[]) =>
  * decision out. A fill halts the task. Without the item or the marketplace's approval, on a crossed
  * book, or without a price, it places nothing. A lower target lists again at that price, leaving the older listing to
  * expire; a higher target than a live listing waits for the user, since only an on-chain cancel
- * removes the cheaper one.
+ * removes the cheaper one. A listing past its expiration is not live, whatever its status says.
  */
 export const decideListing = ({ task, snapshot, now }: DecideListingInput): ListingDecision => {
   if (snapshot.ownListings.some((listing) => listing.executions > 0)) {
@@ -98,9 +105,9 @@ export const decideListing = ({ task, snapshot, now }: DecideListingInput): List
   }
   const price = targetListingPrice(task, snapshot);
   if (price === null) return { type: 'wait', reason: 'noPrice' };
-  const live = cheapestListing(snapshot.ownListings.filter((listing) => listing.active));
+  const live = cheapestListing(snapshot.ownListings.filter((listing) => isLive(listing, now)));
   if (!live || price < live.price) return { type: 'place', price };
-  if (price > live.price) return { type: 'wait', reason: 'needsOnChainCancel' };
+  if (price > live.price) return { type: 'wait', reason: 'needsOnChainCancel', listing: live };
   return needsRefresh(live, task, now) ? { type: 'place', price } : { type: 'keep', listing: live };
 };
 
@@ -108,7 +115,7 @@ export const decideListing = ({ task, snapshot, now }: DecideListingInput): List
  * Decides one item of a listing task without `tokenId`, which lists every item of the collection
  * the wallet holds and never halts. `null` skips an item the wallet no longer holds (sold, moved,
  * or not yet out of the owners index). A sold listing of an item held again is history, so only
- * the item's active listings count.
+ * the item's live listings count.
  */
 export const decideInventoryItem = ({
   task,
@@ -116,7 +123,7 @@ export const decideInventoryItem = ({
   now,
 }: DecideListingInput): Exclude<ListingDecision, { type: 'halt' }> | null => {
   if (!snapshot.owned) return null;
-  const ownListings = snapshot.ownListings.filter((listing) => listing.active);
+  const ownListings = snapshot.ownListings.filter((listing) => isLive(listing, now));
   const decision = decideListing({ task, snapshot: { ...snapshot, ownListings }, now });
   return decision.type === 'halt' ? null : decision;
 };

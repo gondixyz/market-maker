@@ -78,6 +78,15 @@ export class BacktestMarket implements Market {
     this.now = this.start();
   }
 
+  /** Backtest bids are never short of WETH, so there is never ETH to wrap. */
+  async walletBalances() {
+    return { eth: 0n, weth: 2n ** 128n, pending: false };
+  }
+
+  async wrapEth(): Promise<void> {
+    throw new Error('a backtest wraps no ETH');
+  }
+
   /** The first moment the history covers. */
   start() {
     return new Date(
@@ -211,7 +220,6 @@ export class BacktestMarket implements Market {
     return {
       lowestCompetingAsk: sample.floorPrice,
       bestCompetingBid: sample.bestBid,
-      priceStep: collection.priceStep,
       approved: true,
     };
   }

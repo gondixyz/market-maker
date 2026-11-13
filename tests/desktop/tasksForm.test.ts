@@ -12,9 +12,12 @@ import {
   newTask,
   positionsWithErrors,
   savedFormWith,
+  stepWarningOf,
   type StrategyEntry,
   summaryOf,
+  type TaskForm,
   type TasksForm,
+  undercutWarningOf,
 } from '../../src/desktop/renderer/tasksForm';
 import { parseTasksFile } from '../../src/engine/task';
 
@@ -23,7 +26,7 @@ const LISTING = {
   kind: 'listing',
   collection: 'pudgypenguins',
   tokenId: '3950',
-  pricing: { mode: 'undercut', steps: 2 },
+  pricing: { mode: 'undercut', amount: '0.02' },
   minPrice: '2',
   maxPrice: '3',
   expirationMinutes: 120,
@@ -152,13 +155,105 @@ describe('summaryOf', () => {
     [
       'a listing under the cheapest one',
       LISTING,
-      { pricing: { mode: 'undercut', steps: 1 } },
-      'Undercut by 1 step · 2–3 ETH',
+      { pricing: { mode: 'undercut', amount: '0.01' } },
+      'Undercut by 0.01 ETH · 2–3 ETH',
     ],
   ])('describes %s in one line', (_name, task, overrides, summary) => {
     const [form] = formOf(JSON.stringify(fileWith({ tasks: [{ ...task, ...overrides }] }))).tasks;
 
     expect(summaryOf(form)).toBe(summary);
+  });
+});
+
+describe('stepWarningOf', () => {
+  const DECAGON = { priceStep: '0.01', floor: '0.000612', topBid: null };
+  const bid = (pricingMode: TaskForm['pricingMode'], steps = '1') => ({
+    ...newTask('collectionBid', []),
+    pricingMode,
+    steps,
+  });
+
+  test.each([
+    [
+      'an outbid bid',
+      bid('outbid', '2'),
+      'One price step (0.01 WETH) is 1,633% of the floor (0.000612 ETH). Outbidding by 2 steps can bid far above the best bid, up to your max price.',
+    ],
+    [
+      'a bid outbidding by a percentage',
+      bid('outbidPercent'),
+      'One price step (0.01 WETH) is 1,633% of the floor (0.000612 ETH). Outbidding by a percentage still raises the best bid by at least one step, up to your max price.',
+    ],
+    [
+      'a bid in steps under the floor',
+      bid('floorSteps'),
+      'One price step (0.01 WETH) is 1,633% of the floor (0.000612 ETH). Bidding 1 step under the floor can bid far below it, or your min price when it lands under that.',
+    ],
+  ])('warns %s whose step is over 20% of the floor', (_name, task, warning) => {
+    expect(stepWarningOf(task, DECAGON)).toBe(warning);
+  });
+
+  test.each([
+    [
+      'a step of exactly 20% of the floor',
+      bid('outbid'),
+      { priceStep: '0.2', floor: '1', topBid: null },
+    ],
+    [
+      'a step under 20% of the floor',
+      bid('outbid'),
+      { priceStep: '0.01', floor: '1.5', topBid: null },
+    ],
+    ['no floor', bid('outbid'), { priceStep: '0.01', floor: null, topBid: null }],
+    ['a fixed bid', bid('fixed'), DECAGON],
+    ['a bid at a level', bid('level'), DECAGON],
+  ])('stays quiet for %s', (_name, task, pricing) => {
+    expect(stepWarningOf(task, pricing)).toBeNull();
+  });
+});
+
+describe('fileOf an undercut listing', () => {
+  test('leaves out an amount not typed yet, so the schema asks for one', () => {
+    const form = formOf(JSON.stringify(fileWith({ tasks: [LISTING] })));
+    const [task] = form.tasks;
+
+    expect(() => parsedFrom({ ...form, tasks: [{ ...task, amount: ' ' }] })).toThrow(
+      'expected an amount in ETH such as',
+    );
+  });
+});
+
+describe('undercutWarningOf', () => {
+  const DECAGON = { priceStep: '0.01', floor: '0.000612', topBid: null };
+  const undercut = (amount: string) => ({
+    ...newTask('listing', []),
+    pricingMode: 'undercut' as const,
+    amount,
+  });
+
+  test('warns an undercut over 20% of the floor', () => {
+    expect(undercutWarningOf(undercut('0.01'), DECAGON)).toBe(
+      'Your undercut (0.01 ETH) is 1,633% of the floor (0.000612 ETH). It can ask far under the floor, or your min price when it lands under that.',
+    );
+  });
+
+  test.each([
+    [
+      'an undercut of exactly 20% of the floor',
+      undercut('0.2'),
+      { priceStep: '0.01', floor: '1', topBid: null },
+    ],
+    ['an undercut under 20% of the floor', undercut('0.0001'), DECAGON],
+    ['no floor', undercut('0.01'), { priceStep: '0.01', floor: null, topBid: null }],
+    ['an amount not typed yet', undercut(''), DECAGON],
+    ['an amount that is not one', undercut('0.0.1'), DECAGON],
+    [
+      'a listing at a share of the cheapest one',
+      { ...undercut('0.01'), pricingMode: 'floor' as const },
+      DECAGON,
+    ],
+  ])('stays quiet for %s', (_name, task, pricing) => {
+    expect(undercutWarningOf(task, pricing)).toBeNull();
   });
 });
 

@@ -4,17 +4,20 @@ import { version } from '../../../package.json';
 import { type Venue, VENUES } from '../../engine/market';
 import type {
   CancelListingsResult,
+  CollectionApprovalResult,
   CollectionOption,
+  CollectionPricing,
   DesktopStatus,
   TaskStateView,
-  WalletBalances,
   WalletProfile,
+  WethAllowance,
 } from '../api';
 import { CollectionPicker, Thumbnail } from './CollectionPicker';
 import { EthIcon, WethIcon } from './CurrencyIcons';
 import { GondiLogo } from './GondiLogo';
 import {
   type BidPricingMode,
+  defaultExpirationOf,
   errorsByKey,
   fieldErrors,
   fileOf,
@@ -23,10 +26,12 @@ import {
   newTask,
   positionsWithErrors,
   savedFormWith,
+  stepWarningOf,
   type StrategyEntry,
   summaryOf,
   type TaskForm,
   type TasksForm,
+  undercutWarningOf,
 } from './tasksForm';
 import { type Theme, useTheme } from './theme';
 import { VENUE_NAMES, VenueLabel, VenueSelect } from './VenueSelect';
@@ -79,22 +84,53 @@ const Card = ({
   </section>
 );
 
-/** A labelled input with its unit and the error main reported for it. */
+/**
+ * An info icon that shows `text` while hovered or focused. It sits inside a field's `<label>`, so
+ * a click on it is kept from focusing the field's input.
+ */
+const InfoTip = ({ label, text }: { label: string; text: string }) => (
+  <span
+    className="infoTip"
+    tabIndex={0}
+    aria-label={`About ${label}`}
+    onClick={(event) => event.preventDefault()}
+  >
+    <svg width={13} height={13} viewBox="0 0 20 20" fill="none" stroke="currentColor" aria-hidden>
+      <circle cx="10" cy="10" r="8" strokeWidth="1.6" />
+      <path d="M10 9v5M10 6.2v.1" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+    <span className="tooltip" role="tooltip">
+      {text}
+    </span>
+  </span>
+);
+
+/** A labelled input with its unit, an optional explanation, and the error main reported for it. */
 const Field = ({
   label,
   unit,
+  info,
   error,
   wide,
+  rowStart,
   children,
 }: {
   label: string;
   unit?: string;
+  info?: string;
   error?: string;
   wide?: boolean;
+  /** Starts a new row of the grid, so the fields after it group on their own line. */
+  rowStart?: boolean;
   children: ReactNode;
 }) => (
-  <label className={`field${wide ? ' wide' : ''}${error ? ' invalid' : ''}`}>
-    <span className="fieldLabel">{label}</span>
+  <label
+    className={`field${wide ? ' wide' : ''}${rowStart ? ' rowStart' : ''}${error ? ' invalid' : ''}`}
+  >
+    <span className="fieldLabel">
+      {label}
+      {info && <InfoTip label={label} text={info} />}
+    </span>
     <span className="control">
       {children}
       {unit && <span className="unit">{unit}</span>}
@@ -154,7 +190,11 @@ const KeyCard = ({
       return next;
     });
   return (
-    <Card title="Bot wallet">
+    <Card title="Get started">
+      <p className="muted">
+        Import the private key of a wallet used only by the bot, holding just the WETH you are
+        willing to have it bid with: a filled bid is a real purchase.
+      </p>
       {!status.encryptionAvailable && (
         <p className="notice negative">
           This system offers no secure storage, so a key cannot be saved.
@@ -206,19 +246,29 @@ const formatBalance = (amount: string | undefined) =>
     ? '–'
     : new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 }).format(Number(amount));
 
-/** The wallet's balances, re-read every `BALANCE_REFRESH_MS`; `null` until read, or after a failed read. */
-const useBalances = (address: string | null) => {
-  const [balances, setBalances] = useState<WalletBalances | null>(null);
+/**
+ * What `read` returns for the wallet at `address`, re-read every `BALANCE_REFRESH_MS` and on
+ * `refresh`; `null` until read, or after a failed read.
+ */
+const useWalletRead = <Value,>(address: string | null, read: () => Promise<Value>) => {
+  const [value, setValue] = useState<Value | null>(null);
+  const [reads, setReads] = useState(0);
+  useEffect(() => setValue(null), [address]);
   useEffect(() => {
-    setBalances(null);
     if (!address) return;
-    const read = () => api.balances().then(setBalances, () => setBalances(null));
-    void read();
-    const timer = setInterval(read, BALANCE_REFRESH_MS);
+    const update = () => read().then(setValue, () => setValue(null));
+    void update();
+    const timer = setInterval(update, BALANCE_REFRESH_MS);
     return () => clearInterval(timer);
-  }, [address]);
-  return balances;
+  }, [address, read, reads]);
+  const refresh = useCallback(() => setReads((count) => count + 1), []);
+  return { value, refresh };
 };
+
+const readBalances = () => api.balances();
+const readAllowances = () => api.allowances();
+
+const useBalances = (address: string | null) => useWalletRead(address, readBalances).value;
 
 /** The wallet's GONDI profile, read once per address; `null` until read, or after a failed read. */
 const useProfile = (address: string) => {
@@ -348,7 +398,7 @@ const listingsMessage = (result: CancelListingsResult) => {
   }
 };
 
-const ActivityCard = ({
+const StatusCard = ({
   status,
   setStatus,
 }: {
@@ -364,7 +414,7 @@ const ActivityCard = ({
     });
   return (
     <Card
-      title="Activity"
+      title="Status"
       aside={
         <span className={`pill ${status.running ? 'positive' : 'neutral'}`}>
           {status.running ? 'Running' : 'Stopped'}
@@ -425,21 +475,121 @@ const ActivityCard = ({
   );
 };
 
-const BID_PRICING: Record<BidPricingMode, string> = {
-  outbid: 'Outbid by price steps',
-  outbidPercent: 'Outbid by a percentage',
-  floor: 'Percentage of the floor',
-  floorSteps: 'Price steps under the floor',
-  fixed: 'Fixed price',
-  level: 'Join a competing bid level',
+/** Each pricing mode's name in the picker, and what it bids or asks, shown by its info icon. */
+type PricingOption = { label: string; info: string };
+
+const BID_PRICING: Record<BidPricingMode, PricingOption> = {
+  outbid: {
+    label: 'Outbid by price steps',
+    info: 'Bids the best competing bid plus this many price steps, the smallest increment the marketplace accepts. With no other bid, it bids the min price.',
+  },
+  outbidPercent: {
+    label: 'Outbid by a percentage',
+    info: 'Bids the best competing bid plus this percentage of it, and always at least one price step above it. With no other bid, it bids the min price.',
+  },
+  floor: {
+    label: 'Percentage of the floor',
+    info: 'Bids this percentage of the floor, the cheapest listing: 90 bids 90% of it. No bid while the collection has no listing.',
+  },
+  floorSteps: {
+    label: 'Price steps under the floor',
+    info: 'Bids this many price steps under the floor, the cheapest listing: 1 is the highest bid still below it. No bid while the collection has no listing.',
+  },
+  fixed: {
+    label: 'Fixed price',
+    info: 'Always bids the price you set, whatever other bidders do.',
+  },
+  level: {
+    label: 'Join a competing bid level',
+    info: 'Matches the price of the Nth best bid other wallets place: 5 joins the fifth highest price. No bid while fewer prices than that are bid.',
+  },
 };
 
-const STEP_PRICING = new Set<TaskForm['pricingMode']>(['outbid', 'floorSteps', 'undercut']);
+/** How long the collection's pricing waits after the collection last changed before it is read. */
+const COLLECTION_PRICING_DELAY_MS = 400;
 
-const LISTING_PRICING: Record<ListingPricingMode, string> = {
-  undercut: 'Undercut by price steps',
-  floor: 'Percentage of the cheapest listing',
-  fixed: 'Fixed price',
+/**
+ * The price step and floor of `slug` on `venue`, read `COLLECTION_PRICING_DELAY_MS` after either
+ * last changed; `undefined` while it loads or with no collection, `null` when it could not be
+ * read. An answer for an older collection is dropped.
+ */
+const useCollectionPricing = (slug: string, venue: Venue) => {
+  const [answer, setAnswer] = useState<{ key: string; pricing: CollectionPricing | null }>();
+  const term = slug.trim();
+  const key = `${venue}:${term}`;
+  useEffect(() => {
+    if (!term) return;
+    let current = true;
+    const timer = setTimeout(() => {
+      api.collectionPricing(term, venue).then(
+        (pricing) => current && setAnswer({ key, pricing }),
+        () => current && setAnswer({ key, pricing: null }),
+      );
+    }, COLLECTION_PRICING_DELAY_MS);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+    };
+  }, [key, term, venue]);
+  return term && answer?.key === key ? answer.pricing : undefined;
+};
+
+/** An ETH amount to four significant digits, for reading at a glance; a dash for none. */
+const roughEth = (amount: string | null, unit: string) =>
+  amount === null ? '—' : `${Number(Number(amount).toPrecision(4))} ${unit}`;
+
+/**
+ * A value of the picked collection shown beside the inputs, read-only: a dash with no collection,
+ * `loading…` while it is read, `unknown` when it could not be.
+ */
+const CollectionValue = ({
+  label,
+  info,
+  collection,
+  pricing,
+  valueOf,
+}: {
+  label: string;
+  info: string;
+  collection: string;
+  pricing: CollectionPricing | null | undefined;
+  valueOf: (pricing: CollectionPricing) => string;
+}) => (
+  <div className="field">
+    <span className="fieldLabel">
+      {label}
+      <InfoTip label={label} text={info} />
+    </span>
+    <span className="fieldValue">
+      {!collection.trim()
+        ? '—'
+        : pricing === undefined
+          ? 'loading…'
+          : pricing === null
+            ? 'unknown'
+            : valueOf(pricing)}
+    </span>
+  </div>
+);
+
+/** Listings are posted on GONDI only. */
+const LISTING_VENUES: readonly Venue[] = ['gondi'];
+
+const STEP_PRICING = new Set<TaskForm['pricingMode']>(['outbid', 'floorSteps']);
+
+const LISTING_PRICING: Record<ListingPricingMode, PricingOption> = {
+  undercut: {
+    label: 'Undercut by an amount',
+    info: 'Asks this much ETH under the cheapest other listing of the collection. With nothing else listed, it asks the max price.',
+  },
+  floor: {
+    label: 'Percentage of the cheapest listing',
+    info: 'Asks this percentage of the cheapest other listing of the collection: 105 asks 5% above it, 95 asks 5% under it. Nothing is listed while no other item is.',
+  },
+  fixed: {
+    label: 'Fixed price',
+    info: 'Always asks the price you set, whatever other listings ask.',
+  },
 };
 
 const TaskEditor = ({
@@ -470,9 +620,23 @@ const TaskEditor = ({
       onChange({ ...task, [field]: event.target.value }),
   });
   const isListing = task.kind === 'listing';
-  const pricing = isListing ? LISTING_PRICING : BID_PRICING;
+  const venue = isListing ? 'gondi' : task.venue;
+  const collectionPricing = useCollectionPricing(task.collection, venue);
+  const pricingWarning =
+    collectionPricing && (isListing ? undercutWarningOf : stepWarningOf)(task, collectionPricing);
+  const pricing: Partial<Record<TaskForm['pricingMode'], PricingOption>> = isListing
+    ? LISTING_PRICING
+    : BID_PRICING;
   const changeKind = (kind: TaskForm['kind']) =>
-    onChange({ ...task, kind, pricingMode: kind === 'listing' ? 'undercut' : 'outbid' });
+    onChange({
+      ...task,
+      kind,
+      pricingMode: kind === 'listing' ? 'undercut' : 'outbid',
+      expirationMinutes:
+        task.expirationMinutes === defaultExpirationOf(task.kind)
+          ? defaultExpirationOf(kind)
+          : task.expirationMinutes,
+    });
   return (
     <div className="task">
       <div className="taskHeader">
@@ -525,6 +689,7 @@ const TaskEditor = ({
         )}
       </div>
       {errorOf('') && <p className="notice negative">{errorOf('')}</p>}
+      {pricingWarning && <p className="notice negative">{pricingWarning}</p>}
       <div className="grid">
         <Field label="Collection" error={errorOf('collection')}>
           <CollectionPicker
@@ -538,18 +703,36 @@ const TaskEditor = ({
             }}
           />
         </Field>
-        {!isListing && (
-          <Field label="Marketplace" error={errorOf('venue')}>
-            <VenueSelect
-              value={task.venue}
-              disabled={disabled}
-              onChange={(venue) => onChange({ ...task, venue })}
-            />
-          </Field>
-        )}
-        <Field label="Pricing" error={errorOf('pricingMode')}>
+        <CollectionValue
+          label="Floor"
+          info="The collection's cheapest ETH or WETH listing, on any marketplace GONDI indexes."
+          collection={task.collection}
+          pricing={collectionPricing}
+          valueOf={({ floor }) => roughEth(floor, 'ETH')}
+        />
+        <CollectionValue
+          label="Top bid"
+          info="The collection's highest WETH collection bid, on any marketplace GONDI indexes."
+          collection={task.collection}
+          pricing={collectionPricing}
+          valueOf={({ topBid }) => (topBid === undefined ? 'unknown' : roughEth(topBid, 'WETH'))}
+        />
+        <Field label="Marketplace" rowStart error={errorOf('venue')}>
+          <VenueSelect
+            value={venue}
+            venues={isListing ? LISTING_VENUES : VENUES}
+            disabled={disabled}
+            onChange={(venue) => onChange({ ...task, venue })}
+          />
+        </Field>
+        <Field
+          label="Pricing"
+          rowStart
+          info={pricing[task.pricingMode]?.info}
+          error={errorOf('pricingMode')}
+        >
           <select {...text('pricingMode')}>
-            {Object.entries(pricing).map(([mode, label]) => (
+            {Object.entries(pricing).map(([mode, { label }]) => (
               <option key={mode} value={mode}>
                 {label}
               </option>
@@ -567,45 +750,120 @@ const TaskEditor = ({
           </Field>
         )}
         {STEP_PRICING.has(task.pricingMode) && (
-          <Field label="Price steps" error={errorOf('steps')}>
+          <Field
+            label="Price steps"
+            info="A price step is the smallest price increment the marketplace accepts."
+            error={errorOf('steps')}
+          >
             <input inputMode="numeric" {...text('steps')} />
           </Field>
         )}
+        {task.pricingMode === 'undercut' && (
+          <Field
+            label="Amount"
+            unit="ETH"
+            info="How much under the cheapest other listing it asks. GONDI listings take any price, so this is yours to pick."
+            error={errorOf('amount')}
+          >
+            <input inputMode="decimal" {...text('amount')} />
+          </Field>
+        )}
         {task.pricingMode === 'level' && (
-          <Field label="Bid level" error={errorOf('level')}>
+          <Field
+            label="Bid level"
+            info="Which competing price to join, counting from the highest: 1 joins the best bid."
+            error={errorOf('level')}
+          >
             <input inputMode="numeric" {...text('level')} />
           </Field>
         )}
-        <Field label="Min price" unit={isListing ? 'ETH' : 'WETH'} error={errorOf('minPrice')}>
+        {!isListing && (
+          <CollectionValue
+            label="Price step"
+            info="The smallest price increment the marketplace accepts on this collection: each step of a step-priced bid moves the price by this much."
+            collection={task.collection}
+            pricing={collectionPricing}
+            valueOf={({ priceStep }) => `${priceStep} WETH`}
+          />
+        )}
+        <Field
+          label="Min price"
+          rowStart
+          unit={isListing ? 'ETH' : 'WETH'}
+          info={
+            isListing
+              ? 'The lowest it ever asks, above 0: a pricing rule that lands under it asks this instead.'
+              : 'The lowest it ever bids: a pricing rule that lands under it bids this instead.'
+          }
+          error={errorOf('minPrice')}
+        >
           <input inputMode="decimal" {...text('minPrice')} />
         </Field>
-        <Field label="Max price" unit={isListing ? 'ETH' : 'WETH'} error={errorOf('maxPrice')}>
+        <Field
+          label="Max price"
+          unit={isListing ? 'ETH' : 'WETH'}
+          info={
+            isListing
+              ? 'The highest it ever asks: a pricing rule that lands over it asks this instead.'
+              : 'The highest it ever bids: a pricing rule that lands over it bids this instead.'
+          }
+          error={errorOf('maxPrice')}
+        >
           <input inputMode="decimal" {...text('maxPrice')} />
         </Field>
-        <Field label="Expires after" unit="min" error={errorOf('expirationMinutes')}>
+        <Field
+          label="Expires after"
+          rowStart
+          unit="min"
+          info="How long each signed order stays valid. The bot signs a fresh one shortly before it expires, so once the bot stops, nothing it placed stays live for longer than this."
+          error={errorOf('expirationMinutes')}
+        >
           <input inputMode="numeric" {...text('expirationMinutes')} />
         </Field>
         {isListing ? (
-          <Field label="Token id" error={errorOf('tokenId')}>
+          <Field
+            label="Token id"
+            info="The one item to list. Leave it empty to list every item of the collection the wallet holds, each on its own."
+            error={errorOf('tokenId')}
+          >
             <input placeholder="every item held" inputMode="numeric" {...text('tokenId')} />
           </Field>
         ) : (
           <>
-            <Field label="Quantity" error={errorOf('quantity')}>
+            <Field
+              label="Quantity"
+              info="How many items the bid buys. Without max items held or max value held, the strategy stops once it has bought this many."
+              error={errorOf('quantity')}
+            >
               <input inputMode="numeric" {...text('quantity')} />
             </Field>
-            <Field label="Max items held" error={errorOf('maxItems')}>
+            <Field
+              label="Max items held"
+              info="Keep bidding after a fill while the wallet holds fewer items of the collection than this. Required on OpenSea."
+              error={errorOf('maxItems')}
+            >
               <input placeholder="optional" inputMode="numeric" {...text('maxItems')} />
             </Field>
-            <Field label="Max value held" unit="ETH" error={errorOf('maxHeldValue')}>
+            <Field
+              label="Max value held"
+              unit="ETH"
+              info="Keep bidding after a fill while the items the wallet holds, valued at the floor, plus the live bid stay within this many ETH."
+              error={errorOf('maxHeldValue')}
+            >
               <input placeholder="optional" inputMode="decimal" {...text('maxHeldValue')} />
             </Field>
-            <Field label="Bid at most, of the floor" unit="%" error={errorOf('maxFloorPercent')}>
+            <Field
+              label="Bid at most, of the floor"
+              unit="%"
+              info="Caps the bid at this percentage of the floor, under the max price. While it is set, there is no bid when the collection has no listing."
+              error={errorOf('maxFloorPercent')}
+            >
               <input placeholder="optional" inputMode="decimal" {...text('maxFloorPercent')} />
             </Field>
             <Field
               label="Halt when the floor moves"
               unit="%"
+              info="Stops the strategy when the floor moves up or down by more than this percentage from where it was when the bot started."
               error={errorOf('haltOnFloorMovePercent')}
             >
               <input
@@ -656,7 +914,7 @@ const TaskSummary = ({
           {task.kind === 'listing' ? 'Listing' : 'Bid'} · {collection?.name ?? task.collection}
         </span>
       </span>
-      {task.kind === 'listing' ? <span /> : <VenueLabel venue={task.venue} size={16} />}
+      <VenueLabel venue={task.kind === 'listing' ? 'gondi' : task.venue} size={16} />
       <span className="muted summaryLine grow">{summaryOf(task)}</span>
       <button
         className="iconButton"
@@ -724,7 +982,8 @@ const useCollections = (slugs: string[]) => {
 /**
  * The strategies (the tasks file's tasks) and the settings they share, each saved on its own:
  * "Save configuration" writes the settings beside the strategies as last saved; a strategy's save
- * icon writes that strategy; its switch flips and saves it at once; its trash deletes and saves.
+ * icon writes that strategy; its switch flips and saves it at once; its trash deletes and saves,
+ * once the user confirms it for a saved strategy (a new one goes at once).
  * An edit still open elsewhere is never written along. A saved strategy shows collapsed, with a
  * pencil that opens it; a new one, and one a save rejects, opens.
  */
@@ -798,6 +1057,7 @@ const StrategiesCard = ({ running }: { running: boolean }) => {
     }
   };
   const deleteStrategy = async (entry: StrategyEntry) => {
+    if (entry.saved !== null && !confirm(`Delete the strategy "${entry.saved.id}"?`)) return;
     if (entry.saved === null || (await save(savedSettings, { key: entry.key, task: null }))) {
       setEntries((current) => current.filter((each) => each.key !== entry.key));
     }
@@ -825,7 +1085,12 @@ const StrategiesCard = ({ running }: { running: boolean }) => {
       aside={running && <span className="muted">Stop the bot to change its strategies.</span>}
     >
       <div className="grid">
-        <Field label="Exposure limit" unit="WETH" error={errors.get('exposureLimit')}>
+        <Field
+          label="Exposure limit"
+          unit="WETH"
+          info="The most all live bids may commit at once, across every strategy. Listings do not count."
+          error={errors.get('exposureLimit')}
+        >
           <input inputMode="decimal" {...setting('exposureLimit')} />
         </Field>
         <Field label="Re-check every" unit="s" error={errors.get('pollSeconds')}>
@@ -852,7 +1117,11 @@ const StrategiesCard = ({ running }: { running: boolean }) => {
           <Field label="Weekly loss cap" unit="USD" error={errors.get('weeklyUsd')}>
             <input inputMode="decimal" {...setting('weeklyUsd')} />
           </Field>
-          <Field label="Count fills from (UTC)" error={errors.get('since')}>
+          <Field
+            label="Track losses since"
+            info="The loss caps count only trades from 00:00 UTC of this day: items bought earlier, and their later sales, are ignored."
+            error={errors.get('since')}
+          >
             <input type="date" {...setting('since')} />
           </Field>
         </div>
@@ -891,7 +1160,7 @@ const StrategiesCard = ({ running }: { running: boolean }) => {
       )}
       {entries.length === 0 && <p className="muted">No strategies yet.</p>}
       <div className="row">
-        <button className="button outlined" disabled={running} onClick={addTask}>
+        <button className="button tonal" disabled={running} onClick={addTask}>
           + New strategy
         </button>
       </div>
@@ -1029,18 +1298,69 @@ const RpcCard = ({
 
 const SPENDER_NAMES: Record<Venue, string> = { gondi: 'Seaport', opensea: "OpenSea's conduit" };
 
+const formatAllowance = (allowance: WethAllowance | undefined) => {
+  if (allowance === undefined) return '–';
+  return allowance.kind === 'unlimited' ? 'Unlimited' : `${formatBalance(allowance.weth)} WETH`;
+};
+
+const APPROVAL_MESSAGES = {
+  alreadyApproved: 'Already approved: its items can be listed.',
+  declined: 'Declined.',
+} as const;
+
+/**
+ * Runs an approval from the window: `send` asks main, which confirms and broadcasts it; a sent one
+ * is then waited out with `approvalMined`, its hash kept in `mining` meanwhile, and `onMined` runs
+ * once it is mined. `result` says how it ended.
+ */
+const useApproval = (onMined?: () => void) => {
+  const [result, setResult] = useState<string | null>(null);
+  const [mining, setMining] = useState<string | null>(null);
+  const { error, busy, run } = useAction(() => undefined);
+  const approve = (send: () => Promise<CollectionApprovalResult>) =>
+    run(async () => {
+      setResult(null);
+      const outcome = await send();
+      if (outcome.outcome !== 'sent') {
+        setResult(APPROVAL_MESSAGES[outcome.outcome]);
+        return;
+      }
+      setMining(outcome.transactionHash);
+      try {
+        await api.approvalMined(outcome.transactionHash);
+      } finally {
+        setMining(null);
+      }
+      setResult(`Approved in ${outcome.transactionHash}`);
+      onMined?.();
+    });
+  return { approve, result, setResult, mining, error, busy };
+};
+
+/** An approval's progress under its card: the wait for it to be mined, how it ended, or its error. */
+const ApprovalProgress = ({
+  mining,
+  result,
+  error,
+}: Pick<ReturnType<typeof useApproval>, 'mining' | 'result' | 'error'>) => (
+  <>
+    {mining && (
+      <p className="notice pending" role="status">
+        <span className="spinner" aria-hidden="true" />
+        Waiting for the approval to be confirmed on-chain ({shortAddress(mining)})…
+      </p>
+    )}
+    {result && <p className="muted">{result}</p>}
+    {error && <p className="notice negative">{error}</p>}
+  </>
+);
+
 const AllowanceCard = ({ address }: { address: string | null }) => {
   const [amount, setAmount] = useState('');
   const [venue, setVenue] = useState<Venue>('gondi');
-  const [result, setResult] = useState<string | null>(null);
-  const { error, busy, run } = useAction(() => undefined);
-  const approve = () =>
-    run(async () => {
-      const outcome = await api.approveWeth(amount, venue);
-      setResult(
-        outcome.outcome === 'approved' ? `Approved in ${outcome.transactionHash}` : 'Declined.',
-      );
-    });
+  const allowances = useWalletRead(address, readAllowances);
+  const current = allowances.value?.[venue];
+  const { approve, result, mining, error, busy } = useApproval(allowances.refresh);
   return (
     <Card
       title="WETH allowance"
@@ -1060,7 +1380,13 @@ const AllowanceCard = ({ address }: { address: string | null }) => {
     >
       <p className="muted">
         Bids on {VENUE_NAMES[venue]} need {SPENDER_NAMES[venue]} to be allowed to spend your WETH.
-        This is the one action that sends a transaction; you confirm it in a separate dialog.
+        Approving sets the allowance to the amount, rather than adding to it, and each filled bid
+        uses some of it up. This is the one action that sends a transaction; you confirm it in a
+        separate dialog.
+      </p>
+      <p className="allowanceCurrent">
+        <span className="muted">Currently allowed</span>
+        <strong>{formatAllowance(current)}</strong>
       </p>
       <div className="row">
         <span className="control grow">
@@ -1072,12 +1398,64 @@ const AllowanceCard = ({ address }: { address: string | null }) => {
           />
           <span className="unit">WETH</span>
         </span>
-        <button className="button filled" disabled={busy || !amount || !address} onClick={approve}>
+        <button
+          className="button filled"
+          disabled={busy || !amount || !address}
+          onClick={() => approve(() => api.approveWeth(amount, venue))}
+        >
+          Approve…
+        </button>
+        <button
+          className="button outlined"
+          disabled={busy || !address || current?.kind === 'unlimited'}
+          onClick={() => approve(() => api.approveUnlimitedWeth(venue))}
+        >
+          Approve unlimited…
+        </button>
+      </div>
+      <ApprovalProgress mining={mining} result={result} error={error} />
+    </Card>
+  );
+};
+
+/**
+ * Approves a collection for listing: picked like a strategy's collection, it lets the operator
+ * GONDI listings of it fill through (Seaport, or the collection's Seaport conduit) move its items.
+ * Main checks the approval first and asks nothing when it is already in place.
+ */
+const CollectionApprovalCard = ({ address }: { address: string | null }) => {
+  const [slug, setSlug] = useState('');
+  const { collections, remember } = useCollections([slug]);
+  const { approve, result, setResult, mining, error, busy } = useApproval();
+  return (
+    <Card title="Collection approval">
+      <p className="muted">
+        Listings need the marketplace to be allowed to move the collection's items; a listing
+        strategy waits until it is. This sends a transaction; you confirm it in a separate dialog.
+      </p>
+      <div className="row">
+        <span className="control grow">
+          <CollectionPicker
+            value={slug}
+            options={collections}
+            disabled={busy}
+            search={api.searchCollections}
+            onChange={(picked, option) => {
+              setSlug(picked);
+              setResult(null);
+              if (option) remember(option);
+            }}
+          />
+        </span>
+        <button
+          className="button filled"
+          disabled={busy || !slug || !address}
+          onClick={() => approve(() => api.approveCollection(slug))}
+        >
           Approve…
         </button>
       </div>
-      {result && <p className="muted">{result}</p>}
-      {error && <p className="notice negative">{error}</p>}
+      <ApprovalProgress mining={mining} result={result} error={error} />
     </Card>
   );
 };
@@ -1122,7 +1500,7 @@ const ThemeSelector = () => {
   );
 };
 
-/** The settings the gear opens: the OpenSea API key and the WETH allowances. */
+/** The settings the gear opens: the RPC URL, the OpenSea API key, the WETH allowances and collection approvals. */
 const SettingsView = ({
   status,
   setStatus,
@@ -1143,20 +1521,22 @@ const SettingsView = ({
     <RpcCard status={status} setStatus={setStatus} />
     <OpenSeaKeyCard status={status} setStatus={setStatus} />
     <AllowanceCard address={status.address} />
+    <CollectionApprovalCard address={status.address} />
   </main>
 );
 
-/** A strip under the top bar saying whether the bot runs: green while it does, grey when stopped. */
-const StatusBanner = ({ running }: { running: boolean }) => (
-  <div className={`statusBanner ${running ? 'running' : 'stopped'}`} role="status">
-    <span className="statusDot" aria-hidden />
-    {running ? 'Bot running' : 'Bot stopped'}
+/** A green strip under the top bar while the bot runs, its dot pulsing; nothing while stopped. */
+const RunningBanner = () => (
+  <div className="runningBanner" role="status">
+    <span className="liveDot" aria-hidden />
+    Bot running
   </div>
 );
 
 /**
- * The desktop window: the wallet and the gear in the header; the bot's controls with each
- * strategy's state beside the strategies, or the settings once the gear opens them.
+ * The desktop window: the wallet and the gear in the header; until a key is imported, only the
+ * card that imports it; then the bot's controls with each strategy's state beside the strategies,
+ * or the settings once the gear opens them.
  */
 export const App = () => {
   const [status, setStatus] = useState<DesktopStatus | null>(null);
@@ -1187,18 +1567,21 @@ export const App = () => {
           <ThemeSelector />
         </div>
       </header>
-      {status && <StatusBanner running={status.running} />}
+      {status?.running && <RunningBanner />}
       {status && settingsOpen ? (
         <SettingsView
           status={status}
           setStatus={setStatus}
           onClose={() => setSettingsOpen(false)}
         />
+      ) : status && !status.address ? (
+        <main className="onboarding">
+          <KeyCard status={status} setStatus={setStatus} />
+        </main>
       ) : status ? (
         <main className="columns">
           <div className="column">
-            {!status.address && <KeyCard status={status} setStatus={setStatus} />}
-            <ActivityCard status={status} setStatus={setStatus} />
+            <StatusCard status={status} setStatus={setStatus} />
           </div>
           <div className="column">
             <StrategiesCard running={status.running} />

@@ -2,7 +2,7 @@ import type { BidScope, BidVenue, ListingScope, Market, OwnBid, Venue } from './
 
 /**
  * The market the runner trades on when bids go to more than one venue: each bid call goes to the
- * venue its scope or bid names, and everything else (listings, fills, sale terms, ETH's price) to
+ * venue its scope or bid names, and everything else (listings, fills, sale terms, ETH's price, the wallet's balances and wrapping) to
  * `market`. `cancelBids` cancels each venue's bids with that venue, one venue after another, and
  * stops at the first that throws. A venue left out, such as OpenSea without an API key, fails the
  * calls of the tasks that name it.
@@ -57,6 +57,14 @@ export class VenueMarket implements Market {
 
   ethUsdPrice() {
     return this.market.ethUsdPrice();
+  }
+
+  walletBalances() {
+    return this.market.walletBalances();
+  }
+
+  wrapEth(amount: bigint) {
+    return this.market.wrapEth(amount);
   }
 
   private venueOf(venue: Venue) {

@@ -18,9 +18,12 @@ describe('parseTasksFile', () => {
   test.each([
     ['a minimum above the maximum', { minPrice: '10' }],
     ['an amount that is not ETH', { maxPrice: '9e18' }],
-    ['an expiration under 15 minutes', { expirationMinutes: 5 }],
+    ['an expiration under 15 minutes', { expirationMinutes: 14 }],
     ['an unknown pricing mode', { pricing: { mode: 'random' } }],
     ['a maxItems of zero', { maxItems: 0 }],
+    ['a ladder of more than 10 offers', { ladder: { offers: 11, spacing: '0.01' } }],
+    ['a ladder without a spacing', { ladder: { offers: 3 } }],
+    ['a ladder spacing of zero', { ladder: { offers: 3, spacing: '0' } }],
     [
       'an outbid by both steps and a percentage',
       { pricing: { mode: 'outbid', steps: 1, percent: 1 } },
@@ -82,6 +85,19 @@ describe('parseTasksFile', () => {
   });
 });
 
+describe('parseTasksFile ladder', () => {
+  test('reads the spacing into wei', () => {
+    expect(taskOf({ ladder: { offers: 5, spacing: '0.02' } }).ladder).toEqual({
+      offers: 5,
+      spacing: eth('0.02'),
+    });
+  });
+
+  test('leaves a task without one alone', () => {
+    expect(taskOf().ladder).toBeUndefined();
+  });
+});
+
 describe('parseTasksFile lossLimits', () => {
   test('reads the caps and the date the ledger starts', () => {
     expect(
@@ -106,8 +122,8 @@ describe('parseTasksFile listings', () => {
       tokenId: 3950n,
       minPrice: eth('9'),
       maxPrice: eth('12'),
-      expirationMinutes: 60,
-      pricing: { mode: 'undercut', steps: 1 },
+      expirationMinutes: 5,
+      pricing: { mode: 'undercut', amount: eth('0.01') },
     });
   });
 
@@ -118,9 +134,25 @@ describe('parseTasksFile listings', () => {
   test.each([
     ['a token id that is not a number', { tokenId: '#3950' }],
     ['a minimum above the maximum', { minPrice: '13' }],
+    ['a minimum of 0, which could list the item for free', { minPrice: '0' }],
+    ['an undercut without an amount', { pricing: { mode: 'undercut' } }],
+    ['an undercut of 0 ETH', { pricing: { mode: 'undercut', amount: '0' } }],
     ['a bid pricing mode', { pricing: { mode: 'outbid' } }],
+    ['an expiration under 5 minutes', { expirationMinutes: 4 }],
   ])('rejects %s', (_case, overrides) => {
     expect(() => listingTaskOf(overrides)).toThrow();
+  });
+
+  test('asks for the amount of an undercut that has none', () => {
+    expect(() => listingTaskOf({ pricing: { mode: 'undercut' } })).toThrow(
+      'expected an amount in ETH such as',
+    );
+  });
+
+  test('refuses an undercut still counting steps, saying it takes an amount now', () => {
+    expect(() =>
+      listingTaskOf({ pricing: { mode: 'undercut', steps: 1, amount: '0.01' } }),
+    ).toThrow('undercut now takes an amount in ETH, not steps');
   });
 });
 

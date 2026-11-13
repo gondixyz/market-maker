@@ -14,15 +14,18 @@ export const VenueLabel = ({ venue, size = 18 }: { venue: Venue; size?: number }
 );
 
 /**
- * Where a bid is posted, as a select whose options show each venue's mark: a native `<select>`
- * draws text only, so this is a button and a listbox, keyboard included (arrows, Enter, Escape).
+ * Where an order is posted, as a select whose options show each of `venues`' marks: a native
+ * `<select>` draws text only, so this is a button and a listbox, keyboard included (arrows, Enter,
+ * Escape).
  */
 export const VenueSelect = ({
   value,
+  venues = VENUES,
   disabled,
   onChange,
 }: {
   value: Venue;
+  venues?: readonly Venue[];
   disabled: boolean;
   onChange: (venue: Venue) => void;
 }) => {
@@ -30,7 +33,7 @@ export const VenueSelect = ({
   const [open, setOpen] = useState(false);
   const [highlighted, setHighlighted] = useState(0);
   const openList = () => {
-    setHighlighted(VENUES.indexOf(value));
+    setHighlighted(Math.max(venues.indexOf(value), 0));
     setOpen(true);
   };
   const pick = (venue: Venue) => {
@@ -42,10 +45,10 @@ export const VenueSelect = ({
       event.preventDefault();
       if (!open) return openList();
       const step = event.key === 'ArrowDown' ? 1 : -1;
-      setHighlighted((current) => Math.min(Math.max(current + step, 0), VENUES.length - 1));
+      setHighlighted((current) => Math.min(Math.max(current + step, 0), venues.length - 1));
     } else if ((event.key === 'Enter' || event.key === ' ') && open) {
       event.preventDefault();
-      pick(VENUES[highlighted]);
+      pick(venues[highlighted]);
     } else if (event.key === 'Escape') {
       setOpen(false);
     }
@@ -68,7 +71,7 @@ export const VenueSelect = ({
       </button>
       {open && (
         <ul className="pickerList" id={listId} role="listbox">
-          {VENUES.map((venue, index) => (
+          {venues.map((venue, index) => (
             <li
               key={venue}
               id={`${listId}-${index}`}

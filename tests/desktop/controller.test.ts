@@ -1,13 +1,14 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { HttpRequestError, type LocalAccount } from 'viem';
+import { type Address, HttpRequestError, type LocalAccount, maxUint256 } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
 import type { DesktopStatus } from '../../src/desktop/api';
 import { INVOKE_CHANNELS } from '../../src/desktop/api';
 import { type ControllerDependencies, DesktopController } from '../../src/desktop/main/controller';
 import { type HandlerRegistry, registerHandlers } from '../../src/desktop/main/handlers';
-import type { Market } from '../../src/engine/market';
+import type { Market, Venue } from '../../src/engine/market';
 import { VenueMarket } from '../../src/engine/venueMarket';
+import { OPENSEA_CONDUIT } from '../../src/opensea/market';
 import { bidOf, FakeMarket, listingTaskJson, tasksFileOf } from '../fakeMarket';
 
 const TASK = {
@@ -18,6 +19,8 @@ const TASK = {
   minPrice: '5',
   maxPrice: '9',
 };
+
+const AZUKI: Address = '0xED5AF388653567Af2F388E6224dC7C4b3241C544';
 
 const LOSS_LIMITS = { dailyUsd: 1_000, weeklyUsd: 5_000, since: '2029-12-01T00:00:00Z' };
 
@@ -80,7 +83,16 @@ const setup = ({
     chainIdAt: mock(async (_url: string) => rpcChainId),
     useRpcUrl: mock((_url: string | null) => undefined),
     marketFor: mock((_account: LocalAccount, _openSeaApiKey: string | null): Market => market),
-    approveWeth: mock(async () => '0xhash'),
+    sendWethApproval: mock(async () => ({ transactionHash: '0xhash', waitMined: async () => {} })),
+    collectionApproval: mock(async (_account: LocalAccount, _slug: string) => ({
+      contractAddress: AZUKI,
+      operator: OPENSEA_CONDUIT,
+      approved: false,
+    })),
+    sendCollectionApproval: mock(async () => ({
+      transactionHash: '0xapproval',
+      waitMined: async () => {},
+    })),
     activeListings: mock(async (_account: LocalAccount, _slugs: string[]) => [11, 12]),
     cancelListings: mock(async (_account: LocalAccount, _orderIds: number[]) => ['0xcancel']),
     profileOf: mock(async (account: LocalAccount) => ({
@@ -90,7 +102,13 @@ const setup = ({
     pickableCollections: mock(async (_searchTerm?: string) => [
       { slug: 'azuki', name: 'Azuki', image: null },
     ]),
+    collectionPricingOf: mock(async (_slug: string, _venue: Venue) => ({
+      priceStep: 10_000_000_000_000_000n,
+      floor: null as bigint | null,
+      topBid: null as bigint | null | undefined,
+    })),
     balancesOf: async () => ({ eth: 1_250_000_000_000_000_000n, weth: 300_000_000_000_000_000n }),
+    allowancesOf: async () => ({ gondi: 1_500_000_000_000_000_000n, opensea: maxUint256 }),
     confirm: mock(async () => confirmed),
     keepAwake: { start: mock(), stop: mock() },
     notify: mock(),
@@ -279,6 +297,22 @@ describe('DesktopController', () => {
     expect(await controller.balances()).toEqual({ eth: '1.25', weth: '0.3' });
   });
 
+  test('reports each venue allowance in ETH, and the maximum approval as unlimited', async () => {
+    const { controller } = setup();
+
+    expect(await controller.allowances()).toEqual({
+      gondi: { kind: 'limited', weth: '1.5' },
+      opensea: { kind: 'unlimited' },
+    });
+  });
+
+  test('has no allowances to report without a key', async () => {
+    const { controller, dependencies } = setup();
+    await dependencies.vault.remove();
+
+    await expect(controller.allowances()).rejects.toThrow('import the bot wallet key first');
+  });
+
   test("reports the stored wallet's profile", async () => {
     const account = privateKeyToAccount(generatePrivateKey());
     const { controller, dependencies } = setup({ account });
@@ -313,6 +347,46 @@ describe('DesktopController', () => {
     expect(dependencies.pickableCollections.mock.calls).toEqual([['pudgy'], ['pudgy']]);
   });
 
+  test('reads the price step, floor and top bid of the trimmed slug in ETH', async () => {
+    const { controller, dependencies } = setup();
+    dependencies.collectionPricingOf.mockImplementationOnce(async () => ({
+      priceStep: 10_000_000_000_000_000n,
+      floor: 612_000_000_000_000n,
+      topBid: 300_000_000_000_000n,
+    }));
+
+    expect(await controller.collectionPricing(' azuki ', 'gondi')).toEqual({
+      priceStep: '0.01',
+      floor: '0.000612',
+      topBid: '0.0003',
+    });
+    expect(dependencies.collectionPricingOf).toHaveBeenCalledWith('azuki', 'gondi');
+  });
+
+  test('reads a collection with nothing listed or bid as having no floor or top bid', async () => {
+    const { controller } = setup();
+
+    expect(await controller.collectionPricing('azuki', 'opensea')).toEqual({
+      priceStep: '0.01',
+      floor: null,
+      topBid: null,
+    });
+  });
+
+  test('keeps a top bid that could not be read apart from having none', async () => {
+    const { controller, dependencies } = setup();
+    dependencies.collectionPricingOf.mockImplementationOnce(async () => ({
+      priceStep: 10_000_000_000_000_000n,
+      floor: 612_000_000_000_000n,
+      topBid: undefined,
+    }));
+
+    const pricing = await controller.collectionPricing('azuki', 'gondi');
+
+    expect(pricing).toMatchObject({ priceStep: '0.01', floor: '0.000612' });
+    expect(pricing.topBid).toBeUndefined();
+  });
+
   test('has no balances to report without a key', async () => {
     const { controller, dependencies } = setup();
     await dependencies.vault.remove();
@@ -331,10 +405,10 @@ describe('DesktopController', () => {
     const { controller, dependencies } = setup();
 
     expect(await controller.approveWeth('1.5', 'gondi')).toEqual({
-      outcome: 'approved',
+      outcome: 'sent',
       transactionHash: '0xhash',
     });
-    expect(dependencies.approveWeth).toHaveBeenCalledWith(
+    expect(dependencies.sendWethApproval).toHaveBeenCalledWith(
       expect.anything(),
       1_500_000_000_000_000_000n,
       'gondi',
@@ -349,6 +423,52 @@ describe('DesktopController', () => {
     expect(dependencies.confirm).toHaveBeenCalledWith(
       expect.stringMatching(/^Let OpenSea's conduit spend/),
     );
+  });
+
+  test('approves a collection only after the user confirms, naming its operator', async () => {
+    const { controller, dependencies } = setup();
+
+    expect(await controller.approveCollection(' azuki ')).toEqual({
+      outcome: 'sent',
+      transactionHash: '0xapproval',
+    });
+    expect(dependencies.collectionApproval).toHaveBeenCalledWith(expect.anything(), 'azuki');
+    expect(dependencies.confirm).toHaveBeenCalledWith(
+      expect.stringMatching(/^Let OpenSea's conduit move every azuki item/),
+    );
+    expect(dependencies.sendCollectionApproval).toHaveBeenCalledWith(expect.anything(), {
+      contractAddress: AZUKI,
+      operator: OPENSEA_CONDUIT,
+      approved: false,
+    });
+    await controller.approvalMined('0xapproval');
+  });
+
+  test('asks nothing when the collection is already approved', async () => {
+    const { controller, dependencies } = setup();
+    dependencies.collectionApproval.mockImplementation(async () => ({
+      contractAddress: AZUKI,
+      operator: OPENSEA_CONDUIT,
+      approved: true,
+    }));
+
+    expect(await controller.approveCollection('azuki')).toEqual({ outcome: 'alreadyApproved' });
+    expect(dependencies.confirm).not.toHaveBeenCalled();
+    expect(dependencies.sendCollectionApproval).not.toHaveBeenCalled();
+  });
+
+  test('sends no collection approval when the user declines it', async () => {
+    const { controller, dependencies } = setup({ confirmed: false });
+
+    expect(await controller.approveCollection('azuki')).toEqual({ outcome: 'declined' });
+    expect(dependencies.sendCollectionApproval).not.toHaveBeenCalled();
+  });
+
+  test('rejects a blank collection before reading anything', async () => {
+    const { controller, dependencies } = setup();
+
+    await expect(controller.approveCollection('  ')).rejects.toThrow('pick a collection first');
+    expect(dependencies.collectionApproval).not.toHaveBeenCalled();
   });
 
   test('stores the OpenSea API key and only says that it has one', async () => {
@@ -581,11 +701,79 @@ describe('DesktopController', () => {
     expect(dependencies.confirm).not.toHaveBeenCalled();
   });
 
+  test('approves the maximum WETH allowance after the user confirms an unlimited approval', async () => {
+    const { controller, dependencies } = setup();
+
+    expect(await controller.approveUnlimitedWeth('opensea')).toEqual({
+      outcome: 'sent',
+      transactionHash: '0xhash',
+    });
+    expect(dependencies.confirm).toHaveBeenCalledWith(
+      expect.stringMatching(/^Let OpenSea's conduit spend any amount of WETH .* with no limit/),
+    );
+    expect(dependencies.sendWethApproval).toHaveBeenCalledWith(
+      expect.anything(),
+      maxUint256,
+      'opensea',
+    );
+  });
+
+  test('sends nothing when the user declines the unlimited approval', async () => {
+    const { controller, dependencies } = setup({ confirmed: false });
+
+    expect(await controller.approveUnlimitedWeth('gondi')).toEqual({ outcome: 'declined' });
+    expect(dependencies.sendWethApproval).not.toHaveBeenCalled();
+  });
+
+  test('waits for an approval it sent until it is mined, and only once', async () => {
+    const { controller, dependencies } = setup();
+    let mine = () => {};
+    const mined = new Promise<void>((resolve) => {
+      mine = resolve;
+    });
+    dependencies.sendWethApproval.mockImplementationOnce(async () => ({
+      transactionHash: '0xpending',
+      waitMined: () => mined,
+    }));
+    await controller.approveWeth('1.5', 'gondi');
+    let settled = false;
+
+    const waiting = controller.approvalMined('0xpending').then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    mine();
+    await waiting;
+
+    expect(settled).toBe(true);
+    await expect(controller.approvalMined('0xpending')).rejects.toThrow('no approval 0xpending');
+  });
+
+  test('reports a reverted approval to the window that waits on it', async () => {
+    const { controller, dependencies } = setup();
+    dependencies.sendWethApproval.mockImplementationOnce(async () => ({
+      transactionHash: '0xreverted',
+      waitMined: async () => {
+        throw new Error('transaction reverted');
+      },
+    }));
+    await controller.approveUnlimitedWeth('gondi');
+
+    await expect(controller.approvalMined('0xreverted')).rejects.toThrow('transaction reverted');
+  });
+
+  test('waits on no hash it did not send', async () => {
+    const { controller } = setup();
+
+    await expect(controller.approvalMined('0xunknown')).rejects.toThrow('no approval 0xunknown');
+  });
+
   test('sends nothing when the user declines the approval', async () => {
     const { controller, dependencies } = setup({ confirmed: false });
 
     expect(await controller.approveWeth('1.5', 'gondi')).toEqual({ outcome: 'declined' });
-    expect(dependencies.approveWeth).not.toHaveBeenCalled();
+    expect(dependencies.sendWethApproval).not.toHaveBeenCalled();
   });
 
   test.each(['', '0', '-1', 'lots', '1e18'])(

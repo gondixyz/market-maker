@@ -24,15 +24,22 @@ const api: DesktopApi = {
   stop: () => ipcRenderer.invoke(INVOKE_CHANNELS.stop),
   cancelAll: () => ipcRenderer.invoke(INVOKE_CHANNELS.cancelAll),
   approveWeth: (amount, venue) => ipcRenderer.invoke(INVOKE_CHANNELS.approveWeth, amount, venue),
+  approveUnlimitedWeth: (venue) => ipcRenderer.invoke(INVOKE_CHANNELS.approveUnlimitedWeth, venue),
+  approvalMined: (transactionHash) =>
+    ipcRenderer.invoke(INVOKE_CHANNELS.approvalMined, transactionHash),
+  approveCollection: (slug) => ipcRenderer.invoke(INVOKE_CHANNELS.approveCollection, slug),
   cancelAllListings: () => ipcRenderer.invoke(INVOKE_CHANNELS.cancelAllListings),
   importOpenSeaKey: (apiKey) => ipcRenderer.invoke(INVOKE_CHANNELS.importOpenSeaKey, apiKey),
   removeOpenSeaKey: () => ipcRenderer.invoke(INVOKE_CHANNELS.removeOpenSeaKey),
   saveRpcUrl: (url) => ipcRenderer.invoke(INVOKE_CHANNELS.saveRpcUrl, url),
   removeRpcUrl: () => ipcRenderer.invoke(INVOKE_CHANNELS.removeRpcUrl),
   balances: () => ipcRenderer.invoke(INVOKE_CHANNELS.balances),
+  allowances: () => ipcRenderer.invoke(INVOKE_CHANNELS.allowances),
   profile: () => ipcRenderer.invoke(INVOKE_CHANNELS.profile),
   collections: () => ipcRenderer.invoke(INVOKE_CHANNELS.collections),
   searchCollections: (query) => ipcRenderer.invoke(INVOKE_CHANNELS.searchCollections, query),
+  collectionPricing: (slug, venue) =>
+    ipcRenderer.invoke(INVOKE_CHANNELS.collectionPricing, slug, venue),
   onStatus: (listener) => {
     const forward = (_event: unknown, status: DesktopStatus) => listener(status);
     ipcRenderer.on(STATUS_CHANNEL, forward);

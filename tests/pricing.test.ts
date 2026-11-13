@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { targetBidPrice } from '../src/engine/pricing';
+import { ladderPrices, targetBidPrice } from '../src/engine/pricing';
 import { OPENSEA_PRICE_STEP } from '../src/opensea/market';
 import { eth, snapshotOf, taskOf } from './fakeMarket';
 
@@ -69,7 +69,20 @@ describe('targetBidPrice', () => {
       maxItems: 1,
     });
     const snapshot = snapshotOf({ priceStep: OPENSEA_PRICE_STEP, bestCompetingBid: eth('5.5') });
-    expect(targetBidPrice(task, snapshot)).toBe(eth('5.5') + 1n);
+    expect(targetBidPrice(task, snapshot)).toBe(eth('5.51'));
+  });
+
+  test('rounds an OpenSea bid down onto its 0.01 WETH grid', () => {
+    const task = taskOf({
+      venue: 'opensea',
+      pricing: { mode: 'floor', steps: 1 },
+      maxFloorPercent: 99,
+      maxItems: 1,
+      minPrice: '1.5',
+      maxPrice: '2.8',
+    });
+    const snapshot = snapshotOf({ priceStep: OPENSEA_PRICE_STEP, floorPrice: eth('2.35') });
+    expect(targetBidPrice(task, snapshot)).toBe(eth('2.32'));
   });
 
   describe('joining a competing level', () => {
@@ -151,5 +164,51 @@ describe('targetBidPrice', () => {
     test('does not bid when the floor share is under minPrice', () => {
       expect(targetBidPrice(task, snapshotOf({ floorPrice: eth('6') }))).toBeNull();
     });
+  });
+});
+
+describe('ladderPrices', () => {
+  const ladder = (offers: number, spacing: string, overrides: object = {}) =>
+    taskOf({ ladder: { offers, spacing }, ...overrides });
+
+  test('is the target price alone without a ladder', () => {
+    expect(ladderPrices(taskOf(), snapshotOf())).toEqual([eth('8.01')]);
+  });
+
+  test('is empty without a target price', () => {
+    const task = ladder(3, '0.5', { pricing: { mode: 'floor', percent: 90 } });
+    expect(ladderPrices(task, snapshotOf({ floorPrice: null }))).toEqual([]);
+  });
+
+  test('puts the lower offers on the multiples of the spacing below the top', () => {
+    const task = ladder(4, '0.02', { minPrice: '1', maxPrice: '3' });
+    expect(ladderPrices(task, snapshotOf({ bestCompetingBid: eth('2.012') }))).toEqual([
+      eth('2.02'),
+      eth('2'),
+      eth('1.98'),
+      eth('1.96'),
+    ]);
+  });
+
+  test('keeps the lower offers where they are while the top moves within one spacing', () => {
+    const task = ladder(3, '0.5');
+    expect(ladderPrices(task, snapshotOf({ bestCompetingBid: eth('8.05') })).slice(1)).toEqual(
+      ladderPrices(task, snapshotOf({ bestCompetingBid: eth('8.4') })).slice(1),
+    );
+  });
+
+  test('starts the lower offers strictly below a top on the grid', () => {
+    const task = ladder(3, '0.5', { pricing: { mode: 'fixed', price: '8' } });
+    expect(ladderPrices(task, snapshotOf())).toEqual([eth('8'), eth('7.5'), eth('7')]);
+  });
+
+  test('drops the offers under minPrice', () => {
+    const task = ladder(10, '1', { minPrice: '6' });
+    expect(ladderPrices(task, snapshotOf())).toEqual([eth('8.01'), eth('8'), eth('7'), eth('6')]);
+  });
+
+  test('rounds the offers onto the price step without repeats', () => {
+    const task = ladder(4, '0.004');
+    expect(ladderPrices(task, snapshotOf())).toEqual([eth('8.01'), eth('8')]);
   });
 });

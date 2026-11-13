@@ -15,12 +15,20 @@ import { createPublicClient, http, type LocalAccount } from 'viem';
 import { chainFrom, priceApiFrom } from '../../cli/environment';
 import { VenueMarket } from '../../engine/venueMarket';
 import { GondiApi } from '../../gondi/api';
-import { approveWeth, gondiFor, walletBalances } from '../../gondi/client';
+import {
+  collectionApproval,
+  gondiFor,
+  sendCollectionApproval,
+  sendWethApproval,
+  walletBalances,
+  wethAllowances,
+} from '../../gondi/client';
 import { activeListingIds, cancelListings } from '../../gondi/listings';
 import { GondiMarket } from '../../gondi/market';
 import { OpenSeaApi } from '../../opensea/api';
 import { OpenSeaMarket } from '../../opensea/market';
 import { STATUS_CHANNEL } from '../api';
+import { collectionPricing } from './collectionPricing';
 import { pickableCollections } from './collections';
 import { DesktopController } from './controller';
 import { registerHandlers } from './handlers';
@@ -137,10 +145,16 @@ const main = async () => {
     },
     activeListings: (account, slugs) => activeListingIds(new GondiApi(), account.address, slugs),
     cancelListings: (account, orderIds) => cancelListings(gondiOf(account), orderIds),
-    approveWeth: (account, amount, venue) => approveWeth(gondiOf(account), amount, venue),
+    sendWethApproval: (account, amount, venue) => sendWethApproval(gondiOf(account), amount, venue),
+    collectionApproval: (account, slug) =>
+      collectionApproval(gondiOf(account), new GondiApi(), slug),
+    sendCollectionApproval: (account, approval) =>
+      sendCollectionApproval(gondiOf(account), approval),
     balancesOf: (account) => walletBalances(gondiOf(account)),
+    allowancesOf: (account) => wethAllowances(gondiOf(account)),
     profileOf: (account) => walletProfile(new GondiApi(), account.address),
     pickableCollections: (searchTerm) => pickableCollections(new GondiApi(), { searchTerm }),
+    collectionPricingOf: (slug, venue) => collectionPricing(new GondiApi(), slug, venue),
     confirm: async (message) => {
       const { response } = await dialog.showMessageBox(window, {
         type: 'warning',

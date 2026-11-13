@@ -14,8 +14,11 @@
   --on-filled: #ffffff;
   --brand: #254535;
   --brand-hover: #37674f;
+  --on-brand: #ffffff;
+  --tonal: #e3ede8;
+  --on-tonal: #254535;
   --outlined-stroke: #e0e0e0;
-  --positive: #498869;
+  --positive: #3d7558;
   --positive-surface: #f2f8f5;
   --attention: #a9470f;
   --attention-surface: #fdf1e9;
@@ -45,12 +48,15 @@
   --on-filled: #000000;
   --brand: #37674f;
   --brand-hover: #254535;
+  --on-brand: #ffffff;
+  --tonal: #2f3d35;
+  --on-tonal: #b9d6c6;
   --outlined-stroke: #474747;
   --positive: #7eba9c;
   --positive-surface: #1f2b24;
   --attention: #f1945f;
   --attention-surface: #3a2a20;
-  --negative: #e35f59;
+  --negative: #eb736d;
   --negative-surface: #3a1d1b;
   --neutral-surface: #3a3a3a;
   color-scheme: dark;
@@ -77,31 +83,51 @@ body {
   padding: 16px 24px;
 }
 
-.statusBanner {
+.runningBanner {
   align-items: center;
+  background: var(--positive-surface);
   border-bottom: 1px solid var(--outline-variant);
+  color: var(--positive);
   display: flex;
   font-size: 13px;
-  gap: 8px;
+  gap: 10px;
   justify-content: center;
   padding: 6px 24px;
 }
 
-.statusBanner.running {
-  background: var(--positive-surface);
-  color: var(--positive);
-}
-
-.statusBanner.stopped {
-  background: var(--neutral-surface);
-  color: var(--on-surface-variant);
-}
-
-.statusDot {
+.liveDot {
   background: currentColor;
   border-radius: 50%;
   height: 8px;
+  position: relative;
   width: 8px;
+}
+
+.liveDot::after {
+  animation: livePulse 1.6s ease-out infinite;
+  border-radius: 50%;
+  box-shadow: 0 0 0 0 currentColor;
+  content: '';
+  inset: 0;
+  position: absolute;
+}
+
+@keyframes livePulse {
+  from {
+    box-shadow: 0 0 0 0 currentColor;
+    opacity: 0.7;
+  }
+
+  to {
+    box-shadow: 0 0 0 7px currentColor;
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .liveDot::after {
+    animation: none;
+  }
 }
 
 .topBarEnd {
@@ -211,9 +237,6 @@ body {
 }
 
 .segmented.icons button {
-  align-items: center;
-  display: inline-flex;
-  justify-content: center;
   padding: 0;
   width: 32px;
 }
@@ -247,6 +270,12 @@ main.columns {
   max-width: 1440px;
 }
 
+main.onboarding {
+  align-content: center;
+  max-width: 520px;
+  min-height: calc(100vh - 78px);
+}
+
 main.settings {
   max-width: 640px;
 }
@@ -269,6 +298,8 @@ main.settings {
   border-radius: var(--radius-card);
   display: grid;
   gap: 14px;
+  grid-template-columns: minmax(0, 1fr);
+  overflow-wrap: anywhere;
   padding: 20px;
 }
 
@@ -294,6 +325,12 @@ p {
   color: var(--on-surface-variant);
 }
 
+.allowanceCurrent {
+  align-items: baseline;
+  display: flex;
+  justify-content: space-between;
+}
+
 .positiveText {
   color: var(--positive);
 }
@@ -315,6 +352,10 @@ p {
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
 }
 
+.grid > .rowStart {
+  grid-column-start: 1;
+}
+
 .address {
   background: var(--inner);
   border-radius: var(--radius-control);
@@ -333,10 +374,30 @@ p {
   height: var(--control-height);
   justify-content: center;
   padding: 0 16px;
-  transition:
-    background-color 120ms ease-out,
-    border-color 120ms ease-out,
-    opacity 120ms ease-out;
+  position: relative;
+  transition: border-color 120ms ease-out;
+}
+
+.button::before,
+.iconButton::before {
+  background: currentColor;
+  border-radius: inherit;
+  content: '';
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+  position: absolute;
+  transition: opacity 120ms ease-out;
+}
+
+.button:hover:not(:disabled)::before,
+.iconButton:hover:not(:disabled)::before {
+  opacity: 0.08;
+}
+
+.button:active:not(:disabled)::before,
+.iconButton:active:not(:disabled)::before {
+  opacity: 0.12;
 }
 
 .button.small {
@@ -351,11 +412,12 @@ p {
 
 .button.brand {
   background: var(--brand);
-  color: #ffffff;
+  color: var(--on-brand);
 }
 
-.button.brand:hover:not(:disabled) {
-  background: var(--brand-hover);
+.button.tonal {
+  background: var(--tonal);
+  color: var(--on-tonal);
 }
 
 .button.outlined {
@@ -366,10 +428,6 @@ p {
 
 .button.outlined:hover:not(:disabled) {
   border-color: var(--outline);
-}
-
-.button.filled:hover:not(:disabled) {
-  opacity: 0.85;
 }
 
 .button.danger {
@@ -397,11 +455,15 @@ select:not(.control select):focus-visible {
   gap: 6px;
   grid-template-columns: minmax(0, 1fr);
   min-width: 0;
+  position: relative;
 }
 
 .fieldLabel {
+  align-items: center;
   color: var(--on-surface-variant);
+  display: flex;
   font-size: 12px;
+  gap: 4px;
 }
 
 .control {
@@ -412,6 +474,12 @@ select:not(.control select):focus-visible {
   display: flex;
   height: var(--control-height);
   transition: border-color 120ms ease-out;
+}
+
+.fieldValue {
+  align-items: center;
+  display: flex;
+  height: var(--control-height);
 }
 
 .control:hover {
@@ -546,6 +614,7 @@ select:not(.control select):focus-visible {
   flex-shrink: 0;
   height: var(--control-height);
   justify-content: center;
+  position: relative;
   transition:
     background-color 120ms ease-out,
     border-color 120ms ease-out;
@@ -561,10 +630,6 @@ select:not(.control select):focus-visible {
   background: var(--filled);
   border-color: var(--filled);
   color: var(--on-filled);
-}
-
-.iconButton.filled:hover:not(:disabled) {
-  opacity: 0.85;
 }
 
 .iconButton:focus-visible {
@@ -660,21 +725,25 @@ select:not(.control select):focus-visible {
 
 .segmented {
   background: var(--field);
+  border: 1px solid var(--field-stroke);
   border-radius: var(--radius-control);
   display: inline-flex;
   gap: 2px;
-  padding: 3px;
+  padding: 2px;
 }
 
 .segmented button {
+  align-items: center;
   background: transparent;
   border: 0;
   border-radius: 8px;
   color: var(--on-surface-variant);
   cursor: pointer;
+  display: inline-flex;
   font: inherit;
   font-weight: 500;
   height: 28px;
+  justify-content: center;
   padding: 0 12px;
 }
 
@@ -691,6 +760,34 @@ select:not(.control select):focus-visible {
   background: var(--neutral-surface);
   border-radius: var(--radius-control);
   padding: 10px 12px;
+}
+
+.notice.pending {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.spinner {
+  animation: spin 0.8s linear infinite;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  border-right-color: transparent;
+  flex: none;
+  height: 14px;
+  width: 14px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2.4s;
+  }
 }
 
 .notice.negative {
@@ -886,4 +983,41 @@ select:not(.control select):focus-visible {
 
 .venueSelect .pickerList li {
   display: flex;
+}
+
+.infoTip {
+  color: var(--outline);
+  cursor: help;
+  display: inline-flex;
+}
+
+.infoTip:hover,
+.infoTip:focus-visible {
+  color: var(--on-surface);
+}
+
+.infoTip:focus-visible {
+  border-radius: 50%;
+  outline: 2px solid var(--focus);
+}
+
+.tooltip {
+  background: var(--filled);
+  border-radius: var(--radius-control);
+  color: var(--on-filled);
+  font-size: 12px;
+  left: 0;
+  line-height: 1.4;
+  padding: 8px 10px;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+  top: 22px;
+  visibility: hidden;
+  z-index: 10;
+}
+
+.infoTip:hover .tooltip,
+.infoTip:focus .tooltip {
+  visibility: visible;
 }

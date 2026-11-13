@@ -149,6 +149,7 @@ export const bidLevels = (orders: ApiOrder[]) =>
   );
 
 const erc721Abi = parseAbi(['function balanceOf(address owner) view returns (uint256)']);
+const wethAbi = parseAbi(['function deposit() payable']);
 
 const toOwnBid = (order: ApiOrder): OwnBid => ({
   id: String(order.id),
@@ -306,6 +307,41 @@ export class GondiMarket implements Market {
     }
   }
 
+  /**
+   * IMPLEMENTATION NOTE: `getTransactionCount` at `blockTag: 'pending'` counts the transactions
+   * the node holds in its mempool on top of the mined ones at `'latest'`, so a larger pending
+   * count means a transaction is still unmined
+   * (https://viem.sh/docs/actions/public/getTransactionCount).
+   */
+  async walletBalances() {
+    const address = this.account;
+    const [eth, weth, minedCount, pendingCount] = await Promise.all([
+      this.gondi.bcClient.getBalance({ address }),
+      this.gondi.currencyBalance({ tokenAddress: WETH }),
+      this.gondi.bcClient.getTransactionCount({ address, blockTag: 'latest' }),
+      this.gondi.bcClient.getTransactionCount({ address, blockTag: 'pending' }),
+    ]);
+    return { eth, weth, pending: pendingCount > minedCount };
+  }
+
+  /**
+   * IMPLEMENTATION NOTE: WETH9's payable `deposit()` mints one WETH for each wei of ETH sent with
+   * it (https://etherscan.io/address/0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2#code). viem's
+   * `writeContract` sends it through the SDK's wallet client, and `waitForTransactionReceipt`
+   * resolves with the mined receipt, whose `status` is `'reverted'` when it failed
+   * (https://viem.sh/docs/actions/public/waitForTransactionReceipt).
+   */
+  async wrapEth(amount: bigint) {
+    const hash = await this.gondi.wallet.writeContract({
+      address: WETH,
+      abi: wethAbi,
+      functionName: 'deposit',
+      value: amount,
+    });
+    const receipt = await this.gondi.bcClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') throw new Error(`wrapping ETH reverted in ${hash}`);
+  }
+
   async heldItems(slug: string) {
     return this.api.heldNfts({ slug, owner: this.account });
   }
@@ -322,17 +358,16 @@ export class GondiMarket implements Market {
       royalties: market.royalties,
     });
     const prices = await this.priceMarket(slug, market);
-    const [lowestCompetingAsk, bestCompetingBid, priceStep, approved] = await Promise.all([
+    const [lowestCompetingAsk, bestCompetingBid, approved] = await Promise.all([
       this.lowestCompetingAsk(prices.collectionId),
       this.bestCompetingBid(prices.collectionId),
-      this.priceStep(market.collectionId),
       this.gondi.isApprovedNFTForAll({
         nftAddress: market.contractAddress,
         standard: 'ERC721',
         to: operator,
       }),
     ]);
-    return { lowestCompetingAsk, bestCompetingBid, priceStep, approved };
+    return { lowestCompetingAsk, bestCompetingBid, approved };
   }
 
   async itemListing(scope: ListingScope, since: Date): Promise<ItemListing> {

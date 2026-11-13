@@ -4,7 +4,7 @@ import { parseArgs } from 'node:util';
 import { formatEther } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
-import { describeLoss, describeTaskState } from '../engine/describe';
+import { describeLoss, describeTaskState, describeWrap } from '../engine/describe';
 import type { Venue } from '../engine/market';
 import { metricsText } from '../engine/metrics';
 import { Runner } from '../engine/runner';
@@ -12,8 +12,14 @@ import { marginWarnings, parsePositiveEther, parseTasksFile } from '../engine/ta
 import { VenueMarket } from '../engine/venueMarket';
 import { GondiApi } from '../gondi/api';
 import { type FillModel, runBacktest } from '../gondi/backtest';
-import { approveWeth, gondiFor, WETH_SPENDER } from '../gondi/client';
-import { approvalOperator, GondiMarket } from '../gondi/market';
+import {
+  approveCollection,
+  approveWeth,
+  collectionApproval,
+  gondiFor,
+  WETH_SPENDER,
+} from '../gondi/client';
+import { GondiMarket } from '../gondi/market';
 import { parsePriceHistory, recordPriceHistory, serializePriceHistory } from '../gondi/replay';
 import { OpenSeaMarket } from '../opensea/market';
 import { setOpenSeaProfile } from '../opensea/profile';
@@ -34,6 +40,8 @@ const USAGE = `Usage:
                                         terms, claim <username> and set the name its offers show
                                         (the username unless given; letters, digits, _ and -); a
                                         wallet that has a username keeps it
+  market-maker wrap <amount>            wrap <amount> of the wallet's ETH into WETH (sends a
+                                        transaction)
   market-maker approve-nft <collection> let Seaport (or the collection's Seaport conduit) move its
                                         items, so they can be listed (sends a transaction)
   market-maker record-prices <tasks.json> <history.json> [days]
@@ -92,6 +100,7 @@ const runnerFor = async (tasksPath: string) => {
     console.log(`${new Date().toISOString()} ${taskId} ${describeTaskState(state)}`),
   );
   runner.on('loss', (report) => console.log(`${new Date().toISOString()} ${describeLoss(report)}`));
+  runner.on('wrap', (report) => console.log(`${new Date().toISOString()} ${describeWrap(report)}`));
   return runner;
 };
 
@@ -112,6 +121,13 @@ const approveVenue = async (amount: string, venue: Venue) => {
   );
 };
 
+const wrap = async (amount: string) => {
+  const wei = parsePositiveEther(amount);
+  const market = new GondiMarket(await createGondi());
+  await market.wrapEth(wei);
+  console.log(`wrapped ${amount} ETH into WETH in ${market.account}`);
+};
+
 const openSeaProfile = async (username: string, displayName: string | undefined) => {
   const account = privateKeyToAccount(await privateKeyFrom(process.env));
   const shown = displayName ?? username;
@@ -125,16 +141,9 @@ const openSeaProfile = async (username: string, displayName: string | undefined)
 
 const approveNft = async (collection: string) => {
   const gondi = await createGondi();
-  const { contractAddress, seaportConduitKey } = await new GondiApi().collectionMarket({
-    slug: collection,
-  });
-  const operator = await approvalOperator(gondi, seaportConduitKey);
-  const approval = await gondi.approveNFTForAll({
-    nftAddress: contractAddress,
-    standard: 'ERC721',
-    to: operator,
-  });
-  await approval.waitTxInBlock();
+  const approval = await collectionApproval(gondi, new GondiApi(), collection);
+  const { operator } = approval;
+  await approveCollection(gondi, approval);
   console.log(`${operator} may now move ${collection} items from ${gondi.account.address}`);
 };
 
@@ -222,6 +231,7 @@ const main = async () => {
   if (command === 'approve' && argument) return approveVenue(argument, 'gondi');
   if (command === 'approve-opensea' && argument) return approveVenue(argument, 'opensea');
   if (command === 'opensea-profile' && argument) return openSeaProfile(argument, rest[0]);
+  if (command === 'wrap' && argument) return wrap(argument);
   if (command === 'approve-nft' && argument) return approveNft(argument);
   if (command === 'record-prices' && argument && rest[0])
     return recordPrices(argument, rest[0], rest[1]);

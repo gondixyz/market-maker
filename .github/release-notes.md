@@ -13,5 +13,5 @@ time you open the app:
 - **Windows**: SmartScreen shows "Windows protected your PC"; click **More info**, then **Run
   anyway**.
 
-See the README for what the app does and how to set it up. It trades with real funds from the
-wallet you import: start with small limits.
+See the README for what the app does. It trades with real funds from the wallet you import: start
+with small limits.

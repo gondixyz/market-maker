@@ -68,8 +68,6 @@ export type OwnListing = {
 export type ListingMarket = {
   /** The cheapest active listing of another item in the collection, or `null` when there is none. */
   lowestCompetingAsk: bigint | null;
-  /** The collection's bid step, the unit `undercut` counts in; listings themselves are not stepped. */
-  priceStep: bigint;
   /** The best competing bid, which an ask under it contradicts (`crossedBook`); `null` when none. */
   bestCompetingBid: bigint | null;
   /** Whether the marketplace may move the collection's items out of the wallet. */
@@ -120,7 +118,7 @@ export interface Market {
   }): Promise<OwnBid>;
   /**
    * Cancels bids without a transaction. Throws, cancelling nothing, when any of them can only be
-   * cancelled on-chain: the engine never spends gas on its own.
+   * cancelled on-chain: the engine spends gas only on `wrapEth`.
    */
   cancelBids(bids: OwnBid[]): Promise<void>;
   /** The token ids of the collection's items the wallet holds. */
@@ -140,6 +138,16 @@ export interface Market {
   saleTerms(slug: string): Promise<SaleTerms>;
   /** The current price of one ETH in USD. */
   ethUsdPrice(): Promise<number>;
+  /**
+   * The wallet's ETH and WETH, in wei, as of the latest block, and whether it has a transaction
+   * sent but not yet mined, which those balances do not count yet.
+   */
+  walletBalances(): Promise<{ eth: bigint; weth: bigint; pending: boolean }>;
+  /**
+   * Wraps `amount` of the wallet's ETH into WETH and resolves once the transaction is mined. The
+   * one transaction the engine sends on its own, and only with the tasks file's `wrapEth`.
+   */
+  wrapEth(amount: bigint): Promise<void>;
 }
 
 /**
