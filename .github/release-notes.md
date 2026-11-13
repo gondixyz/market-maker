@@ -1,8 +1,8 @@
 Download the installer for your computer:
 
-- **Mac with Apple silicon** (M1 and later): `gondi-market-maker-<version>-mac-arm64.dmg`
-- **Mac with an Intel processor**: `gondi-market-maker-<version>-mac-x64.dmg`
-- **Windows**: `gondi-market-maker-<version>-win-x64.exe`
+- **Mac with Apple silicon** (M1 and later): `gondi-market-maker-mac-arm64.dmg`
+- **Mac with an Intel processor**: `gondi-market-maker-mac-x64.dmg`
+- **Windows**: `gondi-market-maker-win-x64.exe`
 
 The installers are not signed with a developer certificate yet, so your computer warns the first
 time you open the app:

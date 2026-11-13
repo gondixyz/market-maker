@@ -3,6 +3,12 @@
 What changed in each release of GONDI Market Maker, newest first. A release's section is also its
 notes on the GitHub Releases page.
 
+# 0.2.1
+
+- **One-click downloads**: the README has a download button for each platform that always gets the
+  latest installer. The installer files no longer carry the version in their names, such as
+  `gondi-market-maker-mac-arm64.dmg`.
+
 # 0.2.0
 
 - **Breaking: undercut listings by an amount in ETH.** A listing in undercut mode now goes under the
