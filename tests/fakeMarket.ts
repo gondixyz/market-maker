@@ -3,13 +3,18 @@ import { parseEther } from 'viem';
 import type {
   BidScope,
   BidSnapshot,
+  ExitOffer,
+  ExitSale,
   Fill,
   ListingMarket,
   ListingScope,
   ListingSnapshot,
+  LoanVenue,
   Market,
+  MirrorListing,
   OwnBid,
   OwnListing,
+  OwnLoanOffer,
   SaleTerms,
 } from '../src/engine/market';
 import { type BidTask, type ListingTask, parseTasksFile } from '../src/engine/task';
@@ -120,6 +125,8 @@ export class FakeMarket implements Market {
   /** Items whose reads fail. */
   failingTokenIds: bigint[] = [];
   placedListings: { scope: ListingScope; price: bigint; expiration: Date }[] = [];
+  /** Makes every listing placed on GONDI fail. */
+  failPlaceListing = false;
   failNextSnapshot = false;
   /** The wallet's trades, as the sales history reports them. */
   tradeHistory: Fill[] = [];
@@ -135,6 +142,22 @@ export class FakeMarket implements Market {
   wrapped: bigint[] = [];
   /** Makes every wrap time out unmined, leaving it pending. */
   failWrap = false;
+  /** The best bid of another wallet an exit would sell into. */
+  exitBid: ExitOffer | null = null;
+  gasPriceWei = 0n;
+  /** Every sale into an offer, in order; a sold item stays in `heldTokenIds`, as a lagging index would. */
+  exitSales: ExitSale[] = [];
+  /** Makes every sale into an offer fail, as a reverted transaction would. */
+  failExit = false;
+  readonly priceStep = eth('0.0001');
+  /** The wallet's listings on the mirror venue; a cancelled one leaves. */
+  mirrors: MirrorListing[] = [];
+  /** Every listing placed on the mirror venue, in order. */
+  placedMirrors: { scope: ListingScope; price: bigint; expiration: Date }[] = [];
+  /** The id of every mirror listing cancelled, in order. */
+  cancelledMirrors: string[] = [];
+  /** Makes every read of the mirror venue's listings fail. */
+  failMirrors = false;
   private nextId = 100;
   private readonly collectionOfBid = new Map<string, string>();
 
@@ -170,6 +193,42 @@ export class FakeMarket implements Market {
       pending: false,
     };
     this.market = { ...this.market, balance: this.market.balance + amount };
+  }
+
+  async exitOffer() {
+    return this.exitBid;
+  }
+
+  async gasPrice() {
+    return this.gasPriceWei;
+  }
+
+  async sellToOffer(sale: ExitSale) {
+    if (this.failExit) throw new Error('reverted');
+    this.exitSales.push(sale);
+  }
+
+  async mirrorListings() {
+    if (this.failMirrors) throw new Error('OpenSea unavailable');
+    return this.mirrors.map((mirror) => ({ ...mirror }));
+  }
+
+  async placeMirrorListing(listing: { scope: ListingScope; price: bigint; expiration: Date }) {
+    this.placedMirrors.push(listing);
+    const placed = {
+      id: `mirror-${this.nextId++}`,
+      tokenId: listing.scope.tokenId,
+      price: listing.price,
+      expiration: listing.expiration,
+    };
+    this.mirrors.push(placed);
+    return placed;
+  }
+
+  async cancelMirrorListings(listings: MirrorListing[]) {
+    const ids = listings.map((listing) => listing.id);
+    this.cancelledMirrors.push(...ids);
+    this.mirrors = this.mirrors.filter((mirror) => !ids.includes(mirror.id));
   }
 
   async snapshot(scope: BidScope) {
@@ -224,6 +283,7 @@ export class FakeMarket implements Market {
   }
 
   async placeListing(listing: { scope: ListingScope; price: bigint; expiration: Date }) {
+    if (this.failPlaceListing) throw new Error('GONDI refused the listing');
     this.placedListings.push(listing);
     const placed = listingOf({
       id: this.nextId++,
@@ -242,5 +302,71 @@ export class FakeMarket implements Market {
       if (own) own.active = false;
     }
     this.ownBids = this.ownBids.filter((bid) => bid.active || bid.executions > 0);
+  }
+}
+
+export const loanOfferOf = (overrides: Partial<OwnLoanOffer> = {}): OwnLoanOffer => ({
+  id: '0xloan:1',
+  tokenId: 1n,
+  principal: eth('7'),
+  aprBps: 1_000n,
+  durationSeconds: 30n * 86_400n,
+  expiration: new Date('2030-01-01T00:10:00Z'),
+  hidden: false,
+  ...overrides,
+});
+
+/**
+ * An in-memory loan venue: offers placed land among the wallet's own, hiding one marks it hidden,
+ * and the WETH balance and allowance are whatever the test sets.
+ */
+export class FakeLoanVenue implements LoanVenue {
+  balance = eth('100');
+  allowance = eth('100');
+  offers: OwnLoanOffer[] = [];
+  placed: Parameters<LoanVenue['placeLoanOffer']>[0][] = [];
+  hidden: string[] = [];
+  /** Makes every read of the loan offers fail. */
+  failReads = false;
+  private nextId = 1;
+
+  async loanBook() {
+    if (this.failReads) throw new Error('loan offers unavailable');
+    return {
+      offers: this.offers.map((offer) => ({ ...offer })),
+      balance: this.balance,
+      allowance: this.allowance,
+    };
+  }
+
+  async placeLoanOffer(offer: Parameters<LoanVenue['placeLoanOffer']>[0]) {
+    this.placed.push(offer);
+    const placed = loanOfferOf({
+      id: `0xloan:${this.nextId++}`,
+      tokenId: offer.scope.tokenId,
+      principal: offer.principal,
+      aprBps: offer.aprBps,
+      durationSeconds: offer.durationSeconds,
+      expiration: offer.expiration,
+    });
+    this.offers.push(placed);
+    return placed;
+  }
+
+  async hideLoanOffers(offers: OwnLoanOffer[]) {
+    for (const offer of offers) {
+      this.hidden.push(offer.id);
+      const own = this.offers.find((candidate) => candidate.id === offer.id);
+      if (own) own.hidden = true;
+    }
+  }
+}
+
+/** A `FakeMarket` that also lends, through `lending`. */
+export class FakeLendingMarket extends FakeMarket {
+  readonly lending = new FakeLoanVenue();
+
+  get loans() {
+    return this.lending;
   }
 }

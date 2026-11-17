@@ -1,9 +1,8 @@
-import { isCrossed } from './listing';
+import { basisPoints, BPS } from './basisPoints';
+import { isCrossed, refreshMarginMs } from './listing';
 import type { BidSnapshot, OwnBid } from './market';
 import { ladderPrices } from './pricing';
 import type { BidTask } from './task';
-
-const MINIMUM_REFRESH_MARGIN_MS = 2 * 60_000;
 
 export type HaltReason = 'filled' | 'floorMoved';
 export type WaitReason =
@@ -16,16 +15,27 @@ export type WaitReason =
   | 'lossLimit'
   | 'crossedBook';
 
+/** The waits a `resaleBid` offer stands in for: the caps on what the wallet holds or commits. */
+const RESALE_WAITS = ['maxItemsHeld', 'maxHeldValue', 'exposureLimit'] as const;
+export type ResaleWaitReason = (typeof RESALE_WAITS)[number];
+
+/** Whether a `resaleBid` offer may stand in for a wait on `reason`. */
+export const isResaleWait = (reason: WaitReason): reason is ResaleWaitReason =>
+  RESALE_WAITS.some((wait) => wait === reason);
+
 /** An offer to place: its price and how many items it may buy. */
 export type Placement = { price: bigint; quantity: number };
 
 /**
  * What to do with a task's bids this round. Every variant names the wallet's bids to cancel, so a
  * decision is carried out the same way whatever it is: place first (when it places), then cancel.
- * A `bid` keeps the task's offers that already sit where they should and places the missing ones.
+ * A `bid` keeps the task's offers that already sit where they should and places the missing ones;
+ * a `resale` does the same for the one `resaleBid` offer the task keeps instead of waiting on
+ * `reason`.
  */
 export type Decision = { cancel: OwnBid[] } & (
   | { type: 'bid'; keep: OwnBid[]; place: Placement[] }
+  | { type: 'resale'; reason: ResaleWaitReason; price: bigint; keep: OwnBid[]; place: Placement[] }
   | { type: 'wait'; reason: WaitReason }
   | { type: 'halt'; reason: HaltReason }
 );
@@ -34,20 +44,27 @@ export type ReconcileInput = {
   task: BidTask;
   snapshot: BidSnapshot;
   now: Date;
+  /** The pause between two rounds, which the refresh margin must outlast. */
+  pollSeconds: number;
   /** The floor when the task started, what `haltOnFloorMovePercent` is measured against. */
   referenceFloor: bigint | null;
   /** How much the task's bid may commit, after every other task's live bid. */
   exposureAvailable: bigint;
   /** Whether the wallet's loss reached a cap of `lossLimits`, or could not be measured. */
   lossLimitReached: boolean;
+  /**
+   * The price of the task's `resaleBid` offer this round (see `resalePrice`), or `null` when it
+   * keeps none: no `resaleBid`, no price, or no room left under `resaleLimit`.
+   */
+  resalePrice: bigint | null;
 };
 
 const floorMoved = (task: BidTask, floor: bigint | null, referenceFloor: bigint | null) => {
   if (task.haltOnFloorMovePercent === undefined || floor === null || !referenceFloor) return false;
   const movedBps =
-    ((floor > referenceFloor ? floor - referenceFloor : referenceFloor - floor) * 10_000n) /
+    ((floor > referenceFloor ? floor - referenceFloor : referenceFloor - floor) * BPS) /
     referenceFloor;
-  return movedBps > BigInt(Math.round(task.haltOnFloorMovePercent * 100));
+  return movedBps > basisPoints(task.haltOnFloorMovePercent);
 };
 
 const waitReason = (
@@ -106,10 +123,8 @@ const valueCappedQuantity = (
   return price === 0n ? quantity : Math.min(quantity, Number(room / price));
 };
 
-const needsRefresh = (bid: OwnBid, task: BidTask, now: Date) => {
-  const margin = Math.max(MINIMUM_REFRESH_MARGIN_MS, task.expirationMinutes * 6_000);
-  return bid.expiration.getTime() - now.getTime() <= margin;
-};
+const needsRefresh = (bid: OwnBid, task: BidTask, now: Date, pollSeconds: number) =>
+  bid.expiration.getTime() - now.getTime() <= refreshMarginMs(task.expirationMinutes, pollSeconds);
 
 /**
  * The `bid` decision for offers at `prices`, each for `quantity` items: each price keeps the newest
@@ -123,13 +138,16 @@ const bidDecision = (
   activeBids: OwnBid[],
   task: BidTask,
   now: Date,
+  pollSeconds: number,
 ): Decision => {
   const newestFirst = [...activeBids].sort(byNewest);
   const keep = prices.flatMap(
     (price) =>
       newestFirst.find(
         (bid) =>
-          bid.price === price && remaining(bid) === quantity && !needsRefresh(bid, task, now),
+          bid.price === price &&
+          remaining(bid) === quantity &&
+          !needsRefresh(bid, task, now, pollSeconds),
       ) ?? [],
   );
   const offLadder = activeBids.filter((bid) => !keep.includes(bid));
@@ -160,11 +178,28 @@ const bidDecision = (
  * task places nothing beside it, and a wait cancels only the bids it can, so a later round
  * withdraws the rest.
  * A halt still names every active bid, since a halted task gets no later round to withdraw them.
+ * With a `resalePrice`, a wait on what the wallet holds or commits (`RESALE_WAITS`) keeps one offer
+ * for one item at that price instead (`resale`), when the wallet's WETH and allowance cover it.
  */
-export const reconcile = ({
+export const reconcile = (input: ReconcileInput): Decision => {
+  const decision = reconcileBids(input);
+  const { snapshot, resalePrice, task, now, pollSeconds } = input;
+  if (decision.type !== 'wait' || resalePrice === null) return decision;
+  const reason = decision.reason;
+  if (!isResaleWait(reason) || snapshot.balance < resalePrice || snapshot.allowance < resalePrice) {
+    return decision;
+  }
+  const activeBids = snapshot.ownBids.filter((bid) => bid.active);
+  const resale = bidDecision([resalePrice], 1, activeBids, task, now, pollSeconds);
+  if (resale.type !== 'bid') return resale;
+  return { ...resale, type: 'resale', reason, price: resalePrice };
+};
+
+const reconcileBids = ({
   task,
   snapshot,
   now,
+  pollSeconds,
   referenceFloor,
   exposureAvailable,
   lossLimitReached,
@@ -195,5 +230,5 @@ export const reconcile = ({
   if (quantity <= 0) return { type: 'wait', reason: 'maxHeldValue', cancel: withdrawable };
   const reason = waitReason(price * BigInt(quantity), snapshot, exposureAvailable);
   if (reason) return { type: 'wait', reason, cancel: withdrawable };
-  return bidDecision(prices, quantity, activeBids, task, now);
+  return bidDecision(prices, quantity, activeBids, task, now, pollSeconds);
 };

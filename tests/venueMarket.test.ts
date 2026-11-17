@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 
-import type { BidScope, BidVenue, OwnBid } from '../src/engine/market';
+import type { BidScope, BidVenue, ExitOffer, OwnBid } from '../src/engine/market';
 import { VenueMarket } from '../src/engine/venueMarket';
-import { bidOf, FakeMarket, snapshotOf } from './fakeMarket';
+import { bidOf, eth, FakeMarket, snapshotOf } from './fakeMarket';
 
 /** A venue that records the bid calls it gets. */
 const recordingVenue = () => {
@@ -52,5 +52,51 @@ describe('VenueMarket', () => {
     expect(await new VenueMarket(market, { gondi: venue }).heldItems('pudgypenguins')).toEqual(
       market.heldTokenIds,
     );
+  });
+
+  describe('selling a held item', () => {
+    const gondiBid: ExitOffer = { id: '7', venue: 'gondi', netPrice: eth('2.3') };
+    const openSeaOffer: ExitOffer = { id: '0xoffer', venue: 'opensea', netPrice: eth('2.31') };
+    const betterGondiBid: ExitOffer = { ...gondiBid, netPrice: eth('2.32') };
+    const marketsWith = (gondiOffer: ExitOffer | null, openSeaExit: ExitOffer | null) => {
+      const gondi = new FakeMarket();
+      const openSea = new FakeMarket();
+      gondi.exitBid = gondiOffer;
+      openSea.exitBid = openSeaExit;
+      return { gondi, openSea, market: new VenueMarket(gondi, { opensea: openSea }) };
+    };
+    const saleInto = (offer: ExitOffer) => ({
+      scope: { slug: 'pudgypenguins', tokenId: 1n },
+      offer,
+      minProceeds: eth('2.2'),
+    });
+
+    test.each([
+      ['OpenSea when its offer pays more', gondiBid, openSeaOffer, openSeaOffer],
+      ['GONDI when its bid pays more', betterGondiBid, openSeaOffer, betterGondiBid],
+      ['GONDI when OpenSea has no offer', gondiBid, null, gondiBid],
+    ])('takes the bid of %s', async (_name, gondiOffer, openSeaExit, expected) => {
+      const { market } = marketsWith(gondiOffer, openSeaExit);
+      expect(await market.exitOffer('pudgypenguins')).toEqual(expected);
+    });
+
+    test('sells on the venue the offer names', async () => {
+      const { gondi, openSea, market } = marketsWith(gondiBid, openSeaOffer);
+
+      await market.sellToOffer(saleInto(gondiBid));
+      await market.sellToOffer(saleInto(openSeaOffer));
+
+      expect(gondi.exitSales).toEqual([saleInto(gondiBid)]);
+      expect(openSea.exitSales).toEqual([saleInto(openSeaOffer)]);
+    });
+
+    test('sells only into GONDI bids without OpenSea set up', async () => {
+      const gondi = new FakeMarket();
+      gondi.exitBid = gondiBid;
+      const market = new VenueMarket(gondi, {});
+
+      expect(await market.exitOffer('pudgypenguins')).toEqual(gondiBid);
+      await expect(market.sellToOffer(saleInto(openSeaOffer))).rejects.toThrow('not set up');
+    });
   });
 });

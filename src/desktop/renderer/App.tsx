@@ -1,7 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
 import { version } from '../../../package.json';
-import { type Venue, VENUES } from '../../engine/market';
+import { type Trait, type Venue, VENUE_NAMES, VENUES } from '../../engine/market';
 import type {
   CancelListingsResult,
   CollectionApprovalResult,
@@ -9,12 +9,14 @@ import type {
   CollectionPricing,
   DesktopStatus,
   TaskStateView,
+  UsageStatistics,
   WalletProfile,
   WethAllowance,
 } from '../api';
 import { CollectionPicker, Thumbnail } from './CollectionPicker';
 import { EthIcon, WethIcon } from './CurrencyIcons';
 import { GondiLogo } from './GondiLogo';
+import { Select } from './Select';
 import {
   type BidPricingMode,
   defaultExpirationOf,
@@ -34,7 +36,9 @@ import {
   undercutWarningOf,
 } from './tasksForm';
 import { type Theme, useTheme } from './theme';
-import { VENUE_NAMES, VenueLabel, VenueSelect } from './VenueSelect';
+import { TraitPicker } from './TraitPicker';
+import { traitTypes, traitValues, useCollectionTraits } from './traits';
+import { VenueLabel, VenueSelect } from './VenueSelect';
 
 const api = window.marketMaker;
 
@@ -509,19 +513,20 @@ const BID_PRICING: Record<BidPricingMode, PricingOption> = {
 const COLLECTION_PRICING_DELAY_MS = 400;
 
 /**
- * The price step and floor of `slug` on `venue`, read `COLLECTION_PRICING_DELAY_MS` after either
- * last changed; `undefined` while it loads or with no collection, `null` when it could not be
- * read. An answer for an older collection is dropped.
+ * The price step, floor and top bid of `slug` on `venue`, or of its `trait`, read
+ * `COLLECTION_PRICING_DELAY_MS` after any of them last changed; `undefined` while it loads or with
+ * no collection, `null` when it could not be read. An answer for an older pick is dropped.
  */
-const useCollectionPricing = (slug: string, venue: Venue) => {
+const useCollectionPricing = (slug: string, venue: Venue, trait?: Trait) => {
   const [answer, setAnswer] = useState<{ key: string; pricing: CollectionPricing | null }>();
   const term = slug.trim();
-  const key = `${venue}:${term}`;
+  const { type, value } = trait ?? {};
+  const key = JSON.stringify([venue, term, type, value]);
   useEffect(() => {
     if (!term) return;
     let current = true;
     const timer = setTimeout(() => {
-      api.collectionPricing(term, venue).then(
+      api.collectionPricing(term, venue, type && value ? { type, value } : undefined).then(
         (pricing) => current && setAnswer({ key, pricing }),
         () => current && setAnswer({ key, pricing: null }),
       );
@@ -530,7 +535,7 @@ const useCollectionPricing = (slug: string, venue: Venue) => {
       current = false;
       clearTimeout(timer);
     };
-  }, [key, term, venue]);
+  }, [key, term, venue, type, value]);
   return term && answer?.key === key ? answer.pricing : undefined;
 };
 
@@ -545,17 +550,19 @@ const roughEth = (amount: string | null, unit: string) =>
 const CollectionValue = ({
   label,
   info,
+  rowStart,
   collection,
   pricing,
   valueOf,
 }: {
   label: string;
   info: string;
+  rowStart?: boolean;
   collection: string;
   pricing: CollectionPricing | null | undefined;
   valueOf: (pricing: CollectionPricing) => string;
 }) => (
-  <div className="field">
+  <div className={`field${rowStart ? ' rowStart' : ''}`}>
     <span className="fieldLabel">
       {label}
       <InfoTip label={label} text={info} />
@@ -592,6 +599,25 @@ const LISTING_PRICING: Record<ListingPricingMode, PricingOption> = {
   },
 };
 
+const KIND_LABELS: Record<TaskForm['kind'], string> = {
+  collectionBid: 'Collection bid',
+  traitBid: 'Trait bid',
+  listing: 'Listing',
+};
+
+/**
+ * What a collapsed strategy trades: its kind and collection, or a trait bid's trait first, which
+ * the collection's thumbnail beside it already names.
+ */
+const tradeLineOf = (task: TaskForm, collectionName: string) =>
+  task.kind === 'traitBid'
+    ? `${task.traitType || '?'}: ${task.traitValue || '?'} · ${collectionName}`
+    : `${task.kind === 'listing' ? 'Listing' : 'Bid'} · ${collectionName}`;
+
+/** The placeholder of a trait picker: what it waits on, or `pick` once the traits are read. */
+const traitsPrompt = (collection: string, traits: unknown, pick: string) =>
+  !collection.trim() ? 'Pick a collection first' : traits ? pick : 'Loading traits…';
+
 const TaskEditor = ({
   task,
   collections,
@@ -620,8 +646,14 @@ const TaskEditor = ({
       onChange({ ...task, [field]: event.target.value }),
   });
   const isListing = task.kind === 'listing';
+  const isTraitBid = task.kind === 'traitBid';
+  const traits = useCollectionTraits(isTraitBid ? task.collection : '', api.collectionTraits);
   const venue = isListing ? 'gondi' : task.venue;
-  const collectionPricing = useCollectionPricing(task.collection, venue);
+  const pickedTrait =
+    isTraitBid && task.traitType && task.traitValue
+      ? { type: task.traitType, value: task.traitValue }
+      : undefined;
+  const collectionPricing = useCollectionPricing(task.collection, venue, pickedTrait);
   const pricingWarning =
     collectionPricing && (isListing ? undercutWarningOf : stepWarningOf)(task, collectionPricing);
   const pricing: Partial<Record<TaskForm['pricingMode'], PricingOption>> = isListing
@@ -631,7 +663,8 @@ const TaskEditor = ({
     onChange({
       ...task,
       kind,
-      pricingMode: kind === 'listing' ? 'undercut' : 'outbid',
+      pricingMode: kind === 'listing' ? 'undercut' : isListing ? 'outbid' : task.pricingMode,
+      venue: kind === 'traitBid' ? 'gondi' : task.venue,
       expirationMinutes:
         task.expirationMinutes === defaultExpirationOf(task.kind)
           ? defaultExpirationOf(kind)
@@ -645,14 +678,14 @@ const TaskEditor = ({
             <input {...text('id')} />
           </Field>
           <div className="segmented" role="group" aria-label="Task kind">
-            {(['collectionBid', 'listing'] as const).map((kind) => (
+            {(Object.keys(KIND_LABELS) as TaskForm['kind'][]).map((kind) => (
               <button
                 key={kind}
                 className={task.kind === kind ? 'selected' : ''}
                 disabled={disabled}
                 onClick={() => changeKind(kind)}
               >
-                {kind === 'listing' ? 'Listing' : 'Collection bid'}
+                {KIND_LABELS[kind]}
               </button>
             ))}
           </div>
@@ -703,24 +736,67 @@ const TaskEditor = ({
             }}
           />
         </Field>
+        {isTraitBid && (
+          <>
+            <Field label="Trait" error={errorOf('traitType')}>
+              {traits === null ? (
+                <input placeholder="e.g. Background" {...text('traitType')} />
+              ) : (
+                <TraitPicker
+                  value={task.traitType}
+                  options={traits && traitTypes(traits, task.traitType)}
+                  placeholder={traitsPrompt(task.collection, traits, 'Pick a trait')}
+                  disabled={disabled}
+                  onChange={(traitType) => onChange({ ...task, traitType, traitValue: '' })}
+                />
+              )}
+            </Field>
+            <Field label="Value" error={errorOf('traitValue')}>
+              {traits === null ? (
+                <input placeholder="e.g. Blue" {...text('traitValue')} />
+              ) : (
+                <TraitPicker
+                  value={task.traitValue}
+                  options={
+                    traits && task.traitType
+                      ? traitValues(traits, task.traitType, task.traitValue)
+                      : undefined
+                  }
+                  placeholder={traitsPrompt(task.collection, traits, 'Pick a value')}
+                  disabled={disabled}
+                  onChange={(traitValue) => onChange({ ...task, traitValue })}
+                />
+              )}
+            </Field>
+          </>
+        )}
         <CollectionValue
-          label="Floor"
-          info="The collection's cheapest ETH or WETH listing, on any marketplace GONDI indexes."
-          collection={task.collection}
+          label={isTraitBid ? 'Trait floor' : 'Floor'}
+          rowStart={isTraitBid}
+          info={
+            isTraitBid
+              ? 'The cheapest ETH or WETH listing of an item with the trait, on any marketplace GONDI indexes.'
+              : "The collection's cheapest ETH or WETH listing, on any marketplace GONDI indexes."
+          }
+          collection={isTraitBid && !pickedTrait ? '' : task.collection}
           pricing={collectionPricing}
           valueOf={({ floor }) => roughEth(floor, 'ETH')}
         />
         <CollectionValue
-          label="Top bid"
-          info="The collection's highest WETH collection bid, on any marketplace GONDI indexes."
-          collection={task.collection}
+          label={isTraitBid ? 'Trait top bid' : 'Top bid'}
+          info={
+            isTraitBid
+              ? 'The highest WETH bid an item with the trait sells into, a bid on the trait or a collection bid, on any marketplace GONDI indexes: the bids a trait bid competes with.'
+              : "The collection's highest WETH collection bid, on any marketplace GONDI indexes."
+          }
+          collection={isTraitBid && !pickedTrait ? '' : task.collection}
           pricing={collectionPricing}
           valueOf={({ topBid }) => (topBid === undefined ? 'unknown' : roughEth(topBid, 'WETH'))}
         />
         <Field label="Marketplace" rowStart error={errorOf('venue')}>
           <VenueSelect
             value={venue}
-            venues={isListing ? LISTING_VENUES : VENUES}
+            venues={isListing || isTraitBid ? LISTING_VENUES : VENUES}
             disabled={disabled}
             onChange={(venue) => onChange({ ...task, venue })}
           />
@@ -731,13 +807,13 @@ const TaskEditor = ({
           info={pricing[task.pricingMode]?.info}
           error={errorOf('pricingMode')}
         >
-          <select {...text('pricingMode')}>
-            {Object.entries(pricing).map(([mode, { label }]) => (
-              <option key={mode} value={mode}>
-                {label}
-              </option>
-            ))}
-          </select>
+          <Select
+            value={task.pricingMode}
+            options={Object.keys(pricing) as TaskForm['pricingMode'][]}
+            labelOf={(mode) => pricing[mode]?.label}
+            disabled={disabled}
+            onChange={(pricingMode) => onChange({ ...task, pricingMode })}
+          />
         </Field>
         {task.pricingMode === 'fixed' && (
           <Field label="Price" unit={isListing ? 'ETH' : 'WETH'} error={errorOf('price')}>
@@ -821,13 +897,32 @@ const TaskEditor = ({
           <input inputMode="numeric" {...text('expirationMinutes')} />
         </Field>
         {isListing ? (
-          <Field
-            label="Token id"
-            info="The one item to list. Leave it empty to list every item of the collection the wallet holds, each on its own."
-            error={errorOf('tokenId')}
-          >
-            <input placeholder="every item held" inputMode="numeric" {...text('tokenId')} />
-          </Field>
+          <>
+            <Field
+              label="Token id"
+              info="The one item to list. Leave it empty to list every item of the collection the wallet holds, each on its own."
+              error={errorOf('tokenId')}
+            >
+              <input placeholder="every item held" inputMode="numeric" {...text('tokenId')} />
+            </Field>
+            <Field
+              label="Lower the price by"
+              rowStart
+              unit="%"
+              info="Lowers the asking price by this share every few hours the bot has been listing the item, down to the min price. The clock starts when the bot starts, or when it first finds an item held, and a restart lists at the full price again."
+              error={errorOf('decayPercent')}
+            >
+              <input placeholder="optional" inputMode="decimal" {...text('decayPercent')} />
+            </Field>
+            <Field
+              label="Every"
+              unit="h"
+              info="How many hours pass between two price drops."
+              error={errorOf('decayEveryHours')}
+            >
+              <input placeholder="optional" inputMode="decimal" {...text('decayEveryHours')} />
+            </Field>
+          </>
         ) : (
           <>
             <Field
@@ -911,7 +1006,7 @@ const TaskSummary = ({
       <span className="summaryNames">
         <span className="taskName">{task.id}</span>
         <span className="muted summaryLine">
-          {task.kind === 'listing' ? 'Listing' : 'Bid'} · {collection?.name ?? task.collection}
+          {tradeLineOf(task, collection?.name ?? task.collection)}
         </span>
       </span>
       <VenueLabel venue={task.kind === 'listing' ? 'gondi' : task.venue} size={16} />
@@ -1500,14 +1595,71 @@ const ThemeSelector = () => {
   );
 };
 
-/** The settings the gear opens: the RPC URL, the OpenSea API key, the WETH allowances and collection approvals. */
+/**
+ * The choice about anonymous usage statistics, read from main, and the calls that change it; a
+ * failed call keeps the shown choice, since main sends nothing it has not stored.
+ */
+const useUsageStatistics = () => {
+  const [usage, setUsage] = useState<UsageStatistics | null>(null);
+  useEffect(() => {
+    void api.usageStatistics().then(setUsage, () => {});
+  }, []);
+  const change = (call: () => Promise<UsageStatistics>) => void call().then(setUsage, () => {});
+  return { usage, change };
+};
+
+/** The first-run strip that says usage statistics are on and where to turn them off, until OK. */
+const UsageNotice = ({ change }: { change: (call: () => Promise<UsageStatistics>) => void }) => (
+  <div className="usageNotice" role="status">
+    <span>Anonymous usage data is sent to improve the app. You can opt out in Settings.</span>
+    <button className="button filled small" onClick={() => change(api.acknowledgeUsageNotice)}>
+      OK
+    </button>
+  </div>
+);
+
+/** The settings card that turns usage statistics on or off. */
+const UsageStatisticsCard = ({
+  usage,
+  change,
+}: {
+  usage: UsageStatistics;
+  change: (call: () => Promise<UsageStatistics>) => void;
+}) => (
+  <Card title="Usage statistics">
+    <p className="muted">
+      GONDI Market Maker sends anonymous usage statistics. Never your wallet, collections, prices or
+      keys.
+    </p>
+    <label className="toggle">
+      <input
+        type="checkbox"
+        checked={usage.enabled}
+        onChange={(event) => {
+          const enabled = event.target.checked;
+          change(() => api.setUsageStatistics(enabled));
+        }}
+      />
+      Send anonymous usage statistics
+    </label>
+  </Card>
+);
+
+/**
+ * The settings the gear opens: the RPC URL, the OpenSea API key, the WETH allowances, collection
+ * approvals and usage statistics.
+ */
 const SettingsView = ({
   status,
   setStatus,
+  usage,
+  changeUsage,
   onClose,
 }: {
   status: DesktopStatus;
   setStatus: (status: DesktopStatus) => void;
+  usage: UsageStatistics | null;
+  changeUsage: (call: () => Promise<UsageStatistics>) => void;
   onClose: () => void;
 }) => (
   <main className="settings">
@@ -1522,8 +1674,33 @@ const SettingsView = ({
     <OpenSeaKeyCard status={status} setStatus={setStatus} />
     <AllowanceCard address={status.address} />
     <CollectionApprovalCard address={status.address} />
+    {usage && <UsageStatisticsCard usage={usage} change={changeUsage} />}
   </main>
 );
+
+/** How often the window asks main whether a newer release is out, beyond once at launch. */
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * A button beside the version once a newer release is out, opening its download page; nothing
+ * while up to date or when the check fails, which the next check retries.
+ */
+const UpdateButton = () => {
+  const [latest, setLatest] = useState<string | null>(null);
+  useEffect(() => {
+    const check = () => void api.availableUpdate().then(setLatest, () => {});
+    check();
+    const interval = setInterval(check, UPDATE_CHECK_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, []);
+  return (
+    latest && (
+      <button className="button tonal small" onClick={() => void api.openLatestRelease()}>
+        Update to v{latest}
+      </button>
+    )
+  );
+};
 
 /** A green strip under the top bar while the bot runs, its dot pulsing; nothing while stopped. */
 const RunningBanner = () => (
@@ -1541,6 +1718,7 @@ const RunningBanner = () => (
 export const App = () => {
   const [status, setStatus] = useState<DesktopStatus | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const { usage, change: changeUsage } = useUsageStatistics();
   useEffect(() => {
     void api.status().then(setStatus);
     return api.onStatus(setStatus);
@@ -1551,6 +1729,7 @@ export const App = () => {
         <GondiLogo />
         <span className="product">Market Maker</span>
         <span className="version">v{version}</span>
+        <UpdateButton />
         <div className="topBarEnd">
           {status?.address && (
             <WalletMenu status={{ ...status, address: status.address }} setStatus={setStatus} />
@@ -1567,11 +1746,14 @@ export const App = () => {
           <ThemeSelector />
         </div>
       </header>
+      {usage && !usage.noticeShown && <UsageNotice change={changeUsage} />}
       {status?.running && <RunningBanner />}
       {status && settingsOpen ? (
         <SettingsView
           status={status}
           setStatus={setStatus}
+          usage={usage}
+          changeUsage={changeUsage}
           onClose={() => setSettingsOpen(false)}
         />
       ) : status && !status.address ? (

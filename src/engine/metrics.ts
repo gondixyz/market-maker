@@ -116,6 +116,7 @@ const orderMetrics = (report: RoundReport): Metric[] => {
         ...taskLabels(task),
         side: order.side,
         token_id: order.tokenId?.toString() ?? '',
+        order_id: order.id,
       },
       order,
     })),
@@ -167,6 +168,19 @@ const fillMetrics = (report: RoundReport): Metric[] => {
       help: 'What those fills paid, in ETH, before royalties and fees.',
       samples: [...totals.values()].map(({ labels, volume }) => ({ labels, value: toEth(volume) })),
     },
+    {
+      name: 'market_maker_fill_price_eth',
+      help: 'What each of those fills paid, in ETH, before royalties and fees, labelled with when it filled.',
+      samples: report.fills.map((fill) => ({
+        labels: {
+          collection: fill.slug,
+          side: fill.side,
+          token_id: fill.tokenId.toString(),
+          filled_at: fill.timestamp.toISOString(),
+        },
+        value: toEth(fill.price),
+      })),
+    },
   ];
 };
 
@@ -186,6 +200,11 @@ const metricsOf = (report: RoundReport): Metric[] => [
     name: 'market_maker_exposure_limit_eth',
     help: "The most the wallet's live bids may commit at once, in ETH.",
     samples: [{ labels: {}, value: toEth(report.exposureLimit) }],
+  },
+  {
+    name: 'market_maker_committed_eth',
+    help: 'What every live bid commits against the exposure limit, in ETH.',
+    samples: [{ labels: {}, value: toEth(report.committed) }],
   },
   {
     name: 'market_maker_task_status',
@@ -238,7 +257,7 @@ const metricsOf = (report: RoundReport): Metric[] => [
     name: 'market_maker_max_held_value_eth',
     help: "The task's maxHeldValue, in ETH.",
     samples: perTask(report, ({ task }) =>
-      task.kind === 'collectionBid' && task.maxHeldValue !== undefined
+      task.kind !== 'listing' && task.maxHeldValue !== undefined
         ? toEth(task.maxHeldValue)
         : undefined,
     ),

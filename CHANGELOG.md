@@ -3,6 +3,41 @@
 What changed in each release of GONDI Market Maker, newest first. A release's section is also its
 notes on the GitHub Releases page.
 
+# 0.3.0
+
+- **Trait bids**: bid on the items of a collection that have one trait, such as `Background: Blue`,
+  on GONDI. The strategy editor has a searchable trait and value picker and shows the trait's floor
+  and top bid.
+- **One budget for a GONDI and an OpenSea bid**: two bids on the same collection, one on each
+  marketplace, now share the same WETH and count once against the exposure limit.
+- **Lower a listing's price over time**: a listing can drop its price by a percent you pick every
+  few hours while it goes unsold, never below its minimum price, with the new "Lower the price by"
+  fields in the listing editor (`decay` in the tasks file).
+- **Update notice**: when a newer release is out, an **Update to vX.Y.Z** button next to the
+  version opens its download page.
+- **Anonymous usage statistics**: the app sends a few anonymous events (app opened, wallet
+  imported, bot started and stopped) so we can see how it is used. Nothing is sent until you click
+  OK on the first-run notice, and one switch in Settings turns it off. The README lists exactly
+  what is sent.
+- **List on OpenSea too** (command line): with `openSeaListing` on an inventory listing, the bot
+  also lists its items on OpenSea at a markup above its GONDI price.
+- **Sell into bids** (command line): with `bidExit`, the bot sells a held item into the best GONDI
+  or OpenSea bid at a profit, or at a capped loss once it can no longer bid on that collection.
+- **Resale bids** (command line): with `resaleBid`, a collection bid that reached its item, value
+  or exposure cap keeps one offer up at a price it can resell into the best other bid at a profit,
+  within its own `resaleLimit`.
+- **Loan offers on listed items** (command line): with `loanOffer`, an inventory listing also
+  offers a short GONDI loan against each listed item, so a buyer can buy it with buy now, pay
+  later. `approve-loans` approves the WETH those loans lend.
+- **Swap USDC** (command line): `swap-usdc` swaps the wallet's USDC into WETH on Uniswap.
+- Each round reads the wallet's own bids faster, so a round with many bids finishes sooner.
+- Bid ladders keep their second offer a full spacing below the top one.
+- The command line's `approve-nft` no longer sends a transaction when the collection is already
+  approved, and a tasks file with `wrapEth` `keepEth` of `0` is refused instead of failing every
+  wrap.
+- Fixed: a listing or bid could expire between two rounds when the poll interval was long.
+- Fixed: the pricing picker opened its list in the wrong place on Linux.
+
 # 0.2.1
 
 - **One-click downloads**: the README has a download button for each platform that always gets the

@@ -202,13 +202,27 @@ describe('ladderPrices', () => {
     expect(ladderPrices(task, snapshotOf())).toEqual([eth('8'), eth('7.5'), eth('7')]);
   });
 
+  test('keeps the second offer at least one spacing below the top', () => {
+    const argonauts = ladder(5, '0.03', {
+      pricing: { mode: 'fixed', price: '0.41' },
+      minPrice: '0.3',
+      maxPrice: '0.6',
+    });
+    expect(ladderPrices(argonauts, snapshotOf())).toEqual([
+      eth('0.41'),
+      eth('0.36'),
+      eth('0.33'),
+      eth('0.3'),
+    ]);
+  });
+
   test('drops the offers under minPrice', () => {
     const task = ladder(10, '1', { minPrice: '6' });
-    expect(ladderPrices(task, snapshotOf())).toEqual([eth('8.01'), eth('8'), eth('7'), eth('6')]);
+    expect(ladderPrices(task, snapshotOf())).toEqual([eth('8.01'), eth('7'), eth('6')]);
   });
 
   test('rounds the offers onto the price step without repeats', () => {
     const task = ladder(4, '0.004');
-    expect(ladderPrices(task, snapshotOf())).toEqual([eth('8.01'), eth('8')]);
+    expect(ladderPrices(task, snapshotOf())).toEqual([eth('8.01'), eth('8'), eth('7.99')]);
   });
 });

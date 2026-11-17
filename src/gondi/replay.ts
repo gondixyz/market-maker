@@ -1,4 +1,4 @@
-import { type Address, parseEther, zeroAddress } from 'viem';
+import { type Address, parseEther, zeroAddress, zeroHash } from 'viem';
 import { z } from 'zod';
 
 import type {
@@ -26,7 +26,7 @@ export type RecordedSale = { at: Date; price: bigint; tookAsk: boolean };
  * A recorded collection. `priceStep`, `saleFeeBps` and `sales` are what a backtest needs on top of
  * a replay; a history recorded before they were has them at `0n`, `0n` and none.
  */
-export type ReplayCollection = Omit<CollectionMarket, 'floorPrice' | 'highestBid'> & {
+export type ReplayCollection = Omit<CollectionMarket, 'floorPrice'> & {
   samples: PriceSample[];
   priceStep: bigint;
   saleFeeBps: bigint;
@@ -229,7 +229,6 @@ export class PriceReplay implements PriceApi {
       seaportConduitKey: collection.seaportConduitKey,
       royalties: collection.royalties,
       floorPrice: sample.floorPrice,
-      highestBid: sample.bestBid === null ? null : replayOrder(collection, sample, false),
     };
   }
 
@@ -244,6 +243,10 @@ export class PriceReplay implements PriceApi {
       orders: collection && sample && price != null ? [replayOrder(collection, sample, isAsk)] : [],
       nextCursor: null,
     };
+  }
+
+  async traitMarket(): Promise<never> {
+    throw new Error('a price replay serves collection bids only');
   }
 
   async currencyUsdPrice(): Promise<number> {
@@ -276,5 +279,7 @@ const replayOrder = (
   maxExecutions: 1,
   cancelsOffChain: true,
   marketPlace: 'MarketPlace.Gondi',
+  marketPlaceAddress: zeroAddress,
+  originalId: zeroHash,
   collectionId: collection.collectionId,
 });

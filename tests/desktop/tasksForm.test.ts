@@ -82,9 +82,17 @@ describe('formOf and fileOf', () => {
 
   test.each([
     ['a listing with every pricing field', LISTING],
+    [
+      'a listing that lowers its price over time',
+      { ...LISTING, decay: { percent: 5, everyHours: 6 } },
+    ],
     ['a bid that outbids by a percentage', OUTBID_PERCENT],
     ['an OpenSea bid at a competing level', OPENSEA_LEVEL],
     ['a disabled task', { ...OUTBID_PERCENT, enabled: false }],
+    [
+      'a trait bid',
+      { ...OUTBID_PERCENT, kind: 'traitBid', trait: { type: 'Background', value: 'Blue' } },
+    ],
   ])('carry %s through the form unchanged', (_name, task) => {
     const file = fileWith({ tasks: [task] });
 
@@ -157,6 +165,12 @@ describe('summaryOf', () => {
       LISTING,
       { pricing: { mode: 'undercut', amount: '0.01' } },
       'Undercut by 0.01 ETH · 2–3 ETH',
+    ],
+    [
+      'a listing that lowers its price over time',
+      LISTING,
+      { decay: { percent: 5, everyHours: 6 } },
+      'Undercut by 0.02 ETH · −5%/6h · 2–3 ETH',
     ],
   ])('describes %s in one line', (_name, task, overrides, summary) => {
     const [form] = formOf(JSON.stringify(fileWith({ tasks: [{ ...task, ...overrides }] }))).tasks;
@@ -354,6 +368,28 @@ describe('fieldErrors', () => {
       'a level out of range',
       { tasks: [{ ...OPENSEA_LEVEL, pricing: { mode: 'level', level: 0 } }] },
       'tasks.0.level',
+    ],
+    [
+      'a trait bid without its value',
+      {
+        tasks: [{ ...OUTBID_PERCENT, kind: 'traitBid', trait: { type: 'Background', value: '' } }],
+      },
+      'tasks.0.traitValue',
+    ],
+    [
+      'a trait bid without its trait',
+      { tasks: [{ ...OUTBID_PERCENT, kind: 'traitBid' }] },
+      'tasks.0.traitType',
+    ],
+    [
+      'a decay without its hours',
+      { tasks: [{ ...LISTING, decay: { percent: 5 } }] },
+      'tasks.0.decayEveryHours',
+    ],
+    [
+      'a decay out of range',
+      { tasks: [{ ...LISTING, decay: { percent: 150, everyHours: 6 } }] },
+      'tasks.0.decayPercent',
     ],
     [
       'an OpenSea bid without maxItems',

@@ -21,12 +21,15 @@ export type ListingPricingMode = 'undercut' | 'floor' | 'fixed';
 
 export type TaskForm = {
   id: string;
-  kind: 'collectionBid' | 'listing';
+  kind: 'collectionBid' | 'traitBid' | 'listing';
   /** A disabled task stays in the file and does not run. */
   enabled: boolean;
   /** Where a bid is posted; a listing has none and leaves it as `gondi`. */
   venue: Venue;
   collection: string;
+  /** A trait bid's trait, as the collection's metadata names it. */
+  traitType: string;
+  traitValue: string;
   pricingMode: BidPricingMode | ListingPricingMode;
   price: string;
   percent: string;
@@ -43,6 +46,9 @@ export type TaskForm = {
   maxFloorPercent: string;
   haltOnFloorMovePercent: string;
   tokenId: string;
+  /** A listing's `decay`: the share it lowers its price by, and every how many hours. */
+  decayPercent: string;
+  decayEveryHours: string;
 };
 
 export type TasksForm = {
@@ -70,6 +76,11 @@ const textOf = (value: unknown) =>
 
 const objectOf = (value: unknown): Json => (isObject(value) ? value : {});
 
+const KINDS: TaskForm['kind'][] = ['collectionBid', 'traitBid', 'listing'];
+
+const kindOf = (value: unknown): TaskForm['kind'] =>
+  KINDS.find((kind) => kind === value) ?? 'collectionBid';
+
 const idOf = (kind: TaskForm['kind'], takenIds: string[]) => {
   const prefix = kind === 'listing' ? 'listing' : 'bid';
   let number = 1;
@@ -88,6 +99,8 @@ export const newTask = (kind: TaskForm['kind'], takenIds: string[]): TaskForm =>
   enabled: true,
   venue: 'gondi',
   collection: '',
+  traitType: '',
+  traitValue: '',
   pricingMode: kind === 'listing' ? 'undercut' : 'outbid',
   price: '',
   percent: '',
@@ -103,6 +116,8 @@ export const newTask = (kind: TaskForm['kind'], takenIds: string[]): TaskForm =>
   maxFloorPercent: '',
   haltOnFloorMovePercent: '',
   tokenId: '',
+  decayPercent: '',
+  decayEveryHours: '',
 });
 
 const pricingModeOf = (kind: TaskForm['kind'], pricing: Json): TaskForm['pricingMode'] => {
@@ -115,14 +130,18 @@ const pricingModeOf = (kind: TaskForm['kind'], pricing: Json): TaskForm['pricing
 
 const taskFormOf = (raw: unknown): TaskForm => {
   const task = objectOf(raw);
-  const kind = task.kind === 'listing' ? 'listing' : 'collectionBid';
+  const kind = kindOf(task.kind);
   const pricing = objectOf(task.pricing);
+  const trait = objectOf(task.trait);
+  const decay = objectOf(task.decay);
   return {
     ...newTask(kind, []),
     id: textOf(task.id),
     enabled: task.enabled !== false,
     venue: venueOf(task.venue),
     collection: textOf(task.collection),
+    traitType: textOf(trait.type),
+    traitValue: textOf(trait.value),
     pricingMode: pricingModeOf(kind, pricing),
     price: textOf(pricing.price),
     percent: textOf(pricing.percent),
@@ -138,6 +157,8 @@ const taskFormOf = (raw: unknown): TaskForm => {
     maxFloorPercent: textOf(task.maxFloorPercent),
     haltOnFloorMovePercent: textOf(task.haltOnFloorMovePercent),
     tokenId: textOf(task.tokenId),
+    decayPercent: textOf(decay.percent),
+    decayEveryHours: textOf(decay.everyHours),
   };
 };
 
@@ -202,6 +223,15 @@ const pricingOf = (task: TaskForm): Json => {
   }
 };
 
+/**
+ * A listing's `decay`, once either of its fields is typed; a field left empty is left out, so the
+ * schema asks for it.
+ */
+const decayOf = ({ decayPercent, decayEveryHours }: TaskForm) =>
+  decayPercent.trim() === '' && decayEveryHours.trim() === ''
+    ? ''
+    : withoutEmpty({ percent: numberOf(decayPercent), everyHours: numberOf(decayEveryHours) });
+
 const taskFileOf = (task: TaskForm): Json => {
   const shared = {
     id: task.id.trim(),
@@ -215,9 +245,12 @@ const taskFileOf = (task: TaskForm): Json => {
   };
   return withoutEmpty(
     task.kind === 'listing'
-      ? { ...shared, tokenId: task.tokenId.trim() }
+      ? { ...shared, tokenId: task.tokenId.trim(), decay: decayOf(task) }
       : {
           ...shared,
+          ...(task.kind === 'traitBid' && {
+            trait: { type: task.traitType, value: task.traitValue },
+          }),
           venue: task.venue === 'gondi' ? '' : task.venue,
           quantity: numberOf(task.quantity),
           maxItems: numberOf(task.maxItems),
@@ -333,7 +366,11 @@ export const summaryOf = (task: TaskForm) => {
     task.minPrice || task.maxPrice
       ? ` · ${task.minPrice || '0'}–${task.maxPrice || '?'} ${unit}`
       : '';
-  return `${pricingSummaryOf(task, unit)}${limits}`;
+  const decay =
+    task.kind === 'listing' && task.decayPercent
+      ? ` · −${task.decayPercent}%/${task.decayEveryHours || '?'}h`
+      : '';
+  return `${pricingSummaryOf(task, unit)}${decay}${limits}`;
 };
 
 /**
@@ -389,13 +426,37 @@ export const positionsWithErrors = (errors: Map<string, string>) =>
 const PRICING_FIELDS = new Set(['price', 'percent', 'steps', 'level', 'amount']);
 
 /**
+ * The form field a zod error path (split on its dots) belongs to:
+ * - `tasks.<n>.pricing.<leaf>` is `tasks.<n>.<leaf>` when the leaf is a pricing field (`price`,
+ *   `percent`, `steps`, `level`, `amount`), and `tasks.<n>.pricingMode` otherwise, as for a bid's
+ *   one `tasks.<n>.pricing` issue from its plain union;
+ * - `tasks.<n>.trait.value` is `tasks.<n>.traitValue`, and any other `tasks.<n>.trait` path is
+ *   `tasks.<n>.traitType`;
+ * - `tasks.<n>.decay.everyHours` is `tasks.<n>.decayEveryHours`, and any other `tasks.<n>.decay`
+ *   path is `tasks.<n>.decayPercent`;
+ * - `lossLimits.<field>` is the settings field `<field>`;
+ * - any other path is its own field (`tasks.0.collection`, `tasks.0`).
+ */
+const formFieldOf = (segments: string[]) => {
+  const [root, index, group, leaf] = segments;
+  const isTaskGroup = (name: string) => root === 'tasks' && group === name;
+  return isTaskGroup('pricing')
+    ? [root, index, PRICING_FIELDS.has(leaf) ? leaf : 'pricingMode']
+    : isTaskGroup('trait')
+      ? [root, index, leaf === 'value' ? 'traitValue' : 'traitType']
+      : isTaskGroup('decay')
+        ? [root, index, leaf === 'everyHours' ? 'decayEveryHours' : 'decayPercent']
+        : root === 'lossLimits'
+          ? segments.slice(1)
+          : segments;
+};
+
+/**
  * Main's errors (`<path>: <message>`, the path dotted as zod reports it) keyed by the form field
- * they belong to: `tasks.<n>.<field>` for a task's field, the settings field's name otherwise. A
- * pricing error is keyed by its field (`tasks.0.price`) for a listing, and for a bid when zod can
- * tell which pricing shape was meant; otherwise a bid gets one `tasks.<n>.pricing` issue from its
- * plain union, keyed by `tasks.<n>.pricingMode`. An
- * error with no field of its own stays under its path (`tasks.0`, `file`), for the window to show
- * beside the task or the form.
+ * `formFieldOf` maps their path to. A pricing error is keyed by its field (`tasks.0.price`) for a
+ * listing, and for a bid when zod can tell which pricing shape was meant. An error with no field
+ * of its own stays under its path (`tasks.0`, `file`), for the window to show beside the task or
+ * the form.
  */
 export const fieldErrors = (errors: string[]) => {
   const byField = new Map<string, string>();
@@ -403,13 +464,7 @@ export const fieldErrors = (errors: string[]) => {
     const separator = error.indexOf(': ');
     const path = separator === -1 ? 'file' : error.slice(0, separator);
     const message = separator === -1 ? error : error.slice(separator + 2);
-    const segments = path.split('.');
-    const field =
-      segments[0] === 'tasks' && segments[2] === 'pricing'
-        ? [segments[0], segments[1], PRICING_FIELDS.has(segments[3]) ? segments[3] : 'pricingMode']
-        : segments[0] === 'lossLimits'
-          ? segments.slice(1)
-          : segments;
+    const field = formFieldOf(path.split('.'));
     const key = field.join('.') || 'file';
     if (!byField.has(key)) byField.set(key, message);
   }

@@ -21,6 +21,8 @@ const listing = (id: number, marketPlace = 'MarketPlace.Native') => ({
   maxExecutions: 1,
   cancelsOffChain: false,
   marketPlace,
+  marketPlaceAddress: '0x0000000000000000000000000000000000000002',
+  originalId: `0x${id}`,
   nft: { id: String(id), tokenId: String(id) },
 });
 

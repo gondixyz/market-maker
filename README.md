@@ -12,7 +12,8 @@ and stops when a bid fills or the floor moves.
 
 ## Features
 
-- 🏪 **Multiple marketplaces**: collection bids on GONDI and on OpenSea, listings on GONDI.
+- 🏪 **Multiple marketplaces**: collection bids on GONDI and on OpenSea, trait bids and listings on
+  GONDI.
 - 🎯 **Bid strategies**: outbid the best bid by a step or a percent, bid a share of the floor or a
   few steps under it, join the Nth price level of the bid book, or hold a fixed price.
 - 🏷️ **Listing strategies**: undercut the cheapest listing by an amount, list at a share of the floor, or at a
@@ -44,6 +45,29 @@ open the app the first time:
 - **Windows**: at "Windows protected your PC", click **More info**, then **Run anyway**.
 
 What changed in each release is in [`CHANGELOG.md`](CHANGELOG.md).
+
+## Usage statistics
+
+The desktop app sends anonymous usage statistics to its own [PostHog](https://posthog.com) project, so
+we can tell how many people use it and where they get stuck. A notice says so the first time you
+open the app, and nothing is sent until you click its **OK**. Turn them off with the switch in
+Settings → Usage statistics, or by starting the app with `DO_NOT_TRACK=1`. The command line sends
+nothing.
+
+Every event carries a random id made for your installation, the app version, and your operating
+system and processor type. It is sent with the time cut to the day, without a person profile or a
+location lookup, and the project discards your IP address.
+
+| Event                           | Sent when                | Also carries                                                                                                                                                                       |
+| ------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `market_maker_app_started`      | the app opens            | nothing                                                                                                                                                                            |
+| `market_maker_wallet_imported`  | a wallet key is imported | nothing                                                                                                                                                                            |
+| `market_maker_bot_started`      | the bot starts           | how many enabled collection bids, trait bids and listings, how many on GONDI and on OpenSea, how many listings copied to OpenSea, and whether loss limits and your own RPC are set |
+| `market_maker_bot_stopped`      | the bot stops            | how long it ran: under 1 hour, 1 to 6 hours, 6 to 24 hours, or longer                                                                                                              |
+| `market_maker_bot_start_failed` | the bot cannot start     | why: no wallet, no OpenSea API key, or another reason                                                                                                                              |
+
+It never sends your wallet address or key, your collections, prices, amounts or strategy names, or
+any error message. The code that sends them is `src/desktop/main/telemetry.ts`.
 
 ## Disclaimer
 

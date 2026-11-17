@@ -24,7 +24,7 @@ const MARKET = {
   royalties: [
     { beneficiary: '0xa858ddc0445d8131dac4d1de01f834ffcba52ef1', percentage: 2.5, required: true },
   ],
-  statistics: { minAskPrice: { amount: '1' }, highestApplicableBid: null },
+  statistics: { minAskPrice: { amount: '1' } },
 };
 
 /** A fake lending API: the floor at a moment is 10 ETH plus its hour of the day, bids at 90%. */
@@ -176,9 +176,10 @@ describe('PriceReplay', () => {
     const replay = new PriceReplay(history(), 1, at(minutes));
 
     const market = await replay.collectionMarket({ slug: 'boredapeyachtclub' });
+    const bids = await replay.orders({ side: 'BID', collections: [market.collectionId] });
 
     expect(market.floorPrice).toBe(floorPrice);
-    expect(market.highestBid?.price ?? null).toBe(bestBid);
+    expect(bids.orders.map((order) => order.price)).toEqual(bestBid === null ? [] : [bestBid]);
   });
 
   test('runs its clock `speed` times faster', () => {

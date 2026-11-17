@@ -6,6 +6,7 @@ import type { DesktopStatus } from '../../src/desktop/api';
 import { INVOKE_CHANNELS } from '../../src/desktop/api';
 import { type ControllerDependencies, DesktopController } from '../../src/desktop/main/controller';
 import { type HandlerRegistry, registerHandlers } from '../../src/desktop/main/handlers';
+import type { TelemetryEvent } from '../../src/desktop/main/telemetry';
 import type { Market, Venue } from '../../src/engine/market';
 import { VenueMarket } from '../../src/engine/venueMarket';
 import { OPENSEA_CONDUIT } from '../../src/opensea/market';
@@ -28,7 +29,7 @@ const setup = ({
   account = privateKeyToAccount(generatePrivateKey()),
   confirmed = true,
   unreadable = false,
-  tasksFile = tasksFileOf([TASK], { pollSeconds: 3600 }),
+  tasksFile = tasksFileOf([TASK], { pollSeconds: 1_500 }),
   openSeaApiKey = null as string | null,
   rpcUrl = null as string | null,
   rpcChainId = 1,
@@ -107,12 +108,14 @@ const setup = ({
       floor: null as bigint | null,
       topBid: null as bigint | null | undefined,
     })),
+    collectionTraits: mock(async (_slug: string) => [{ type: 'Background', value: 'Blue' }]),
     balancesOf: async () => ({ eth: 1_250_000_000_000_000_000n, weth: 300_000_000_000_000_000n }),
     allowancesOf: async () => ({ gondi: 1_500_000_000_000_000_000n, opensea: maxUint256 }),
     confirm: mock(async () => confirmed),
     keepAwake: { start: mock(), stop: mock() },
     notify: mock(),
     publish: (status: DesktopStatus) => published.push(status),
+    telemetry: { capture: mock((_event: TelemetryEvent) => undefined) },
   } satisfies ControllerDependencies;
   return { controller: new DesktopController(dependencies), dependencies, market, published };
 };
@@ -338,6 +341,22 @@ describe('DesktopController', () => {
     expect(dependencies.pickableCollections).toHaveBeenCalledTimes(2);
   });
 
+  test("reads a collection's traits once, and again after a failed read", async () => {
+    const { controller, dependencies } = setup();
+    dependencies.collectionTraits.mockImplementationOnce(async () => {
+      throw new Error('API down');
+    });
+
+    await expect(controller.collectionTraits('azuki')).rejects.toThrow('API down');
+    expect(await controller.collectionTraits('azuki')).toEqual([
+      { type: 'Background', value: 'Blue' },
+    ]);
+    await controller.collectionTraits('azuki');
+    await controller.collectionTraits('milady');
+
+    expect(dependencies.collectionTraits.mock.calls).toEqual([['azuki'], ['azuki'], ['milady']]);
+  });
+
   test('searches the picker collections afresh each time, by the trimmed query', async () => {
     const { controller, dependencies } = setup();
 
@@ -360,7 +379,7 @@ describe('DesktopController', () => {
       floor: '0.000612',
       topBid: '0.0003',
     });
-    expect(dependencies.collectionPricingOf).toHaveBeenCalledWith('azuki', 'gondi');
+    expect(dependencies.collectionPricingOf).toHaveBeenCalledWith('azuki', 'gondi', undefined);
   });
 
   test('reads a collection with nothing listed or bid as having no floor or top bid', async () => {
@@ -399,6 +418,69 @@ describe('DesktopController', () => {
     await dependencies.vault.remove();
 
     await expect(controller.start()).rejects.toThrow('import the bot wallet key first');
+    expect(dependencies.telemetry.capture).toHaveBeenCalledWith({
+      event: 'market_maker_bot_start_failed',
+      properties: { reason: 'no_wallet' },
+    });
+  });
+
+  test('records an imported wallet, a start and a stop, with counts and no collection or price', async () => {
+    const account = privateKeyToAccount(generatePrivateKey());
+    const { controller, dependencies } = setup({
+      account,
+      tasksFile: tasksFileOf(
+        [
+          TASK,
+          { ...TASK, id: 'off', enabled: false },
+          {
+            ...TASK,
+            id: 'blue',
+            kind: 'traitBid',
+            trait: { type: 'Background', value: 'Blue' },
+          },
+          { ...TASK, id: 'sea', venue: 'opensea', maxItems: 1 },
+          listingTaskJson({ tokenId: undefined, openSeaListing: {} }),
+        ],
+        { pollSeconds: 3_600, lossLimits: LOSS_LIMITS },
+      ),
+      openSeaApiKey: 'a'.repeat(32),
+    });
+
+    await controller.importKey(generatePrivateKey());
+    await controller.start();
+    await controller.stop();
+
+    const events = dependencies.telemetry.capture.mock.calls.map(([event]) => event);
+    expect(events).toEqual([
+      { event: 'market_maker_wallet_imported' },
+      {
+        event: 'market_maker_bot_started',
+        properties: {
+          collection_bids: 2,
+          trait_bids: 1,
+          listings: 1,
+          gondi_tasks: 3,
+          opensea_tasks: 1,
+          opensea_mirrors: 1,
+          loss_limits: true,
+          custom_rpc: false,
+        },
+      },
+      { event: 'market_maker_bot_stopped', properties: { run_length: 'under_1h' } },
+    ]);
+    const sent = JSON.stringify(events);
+    for (const secret of ['pudgypenguins', 'Blue', '9', account.address]) {
+      expect(sent).not.toContain(secret);
+    }
+  });
+
+  test('records no stop for a bot that was not running', async () => {
+    const { controller, dependencies } = setup();
+
+    await controller.stop();
+    await controller.cancelAll();
+
+    expect(dependencies.telemetry.capture).not.toHaveBeenCalled();
   });
 
   test('approves WETH only after the user confirms', async () => {
@@ -595,11 +677,15 @@ describe('DesktopController', () => {
   });
 
   test('will not start OpenSea bids without an OpenSea API key', async () => {
-    const { controller } = setup({
+    const { controller, dependencies } = setup({
       tasksFile: tasksFileOf([{ ...TASK, venue: 'opensea', maxItems: 1 }], { pollSeconds: 3600 }),
     });
 
     await expect(controller.start()).rejects.toThrow('add your OpenSea API key');
+    expect(dependencies.telemetry.capture).toHaveBeenCalledWith({
+      event: 'market_maker_bot_start_failed',
+      properties: { reason: 'missing_opensea_key' },
+    });
   });
 
   test('cancel-all without an OpenSea API key still withdraws the GONDI bids', async () => {
@@ -788,6 +874,13 @@ describe('DesktopController', () => {
 });
 
 describe('registerHandlers', () => {
+  const updates = { availableUpdate: async () => null, openLatestRelease: async () => {} };
+  const usageStatistics = { enabled: true, noticeShown: true };
+  const usage = {
+    usageStatistics: async () => usageStatistics,
+    setUsageStatistics: mock(async (_enabled: boolean) => usageStatistics),
+    acknowledgeUsageNotice: async () => usageStatistics,
+  };
   const recorder = () => {
     const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>();
     const registry: HandlerRegistry = {
@@ -798,14 +891,14 @@ describe('registerHandlers', () => {
 
   test('handles exactly the declared channels', () => {
     const { handlers, registry } = recorder();
-    registerHandlers(registry, setup().controller);
+    registerHandlers(registry, setup().controller, updates, usage);
     expect([...handlers.keys()].sort()).toEqual(Object.values(INVOKE_CHANNELS).sort());
   });
 
   test('passes string arguments through and rejects anything else', async () => {
     const { handlers, registry } = recorder();
     const { controller, dependencies } = setup();
-    registerHandlers(registry, controller);
+    registerHandlers(registry, controller, updates, usage);
     const saveTasks = handlers.get(INVOKE_CHANNELS.saveTasks)!;
 
     await saveTasks({}, '{"version":1}');
@@ -813,9 +906,19 @@ describe('registerHandlers', () => {
     expect(() => saveTasks({}, { version: 1 })).toThrow('expected a string argument');
   });
 
+  test('turns usage statistics on or off only with a boolean', async () => {
+    const { handlers, registry } = recorder();
+    registerHandlers(registry, setup().controller, updates, usage);
+    const setUsageStatistics = handlers.get(INVOKE_CHANNELS.setUsageStatistics)!;
+
+    await setUsageStatistics({}, false);
+    expect(usage.setUsageStatistics).toHaveBeenCalledWith(false);
+    expect(() => setUsageStatistics({}, 'false')).toThrow('expected a boolean argument');
+  });
+
   test('rejects a venue it does not know', () => {
     const { handlers, registry } = recorder();
-    registerHandlers(registry, setup().controller);
+    registerHandlers(registry, setup().controller, updates, usage);
 
     expect(() => handlers.get(INVOKE_CHANNELS.approveWeth)!({}, '1', 'blur')).toThrow(
       'expected one of gondi, opensea',

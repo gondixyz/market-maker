@@ -79,24 +79,27 @@ MARKET_MAKER_PRIVATE_KEY=0x... bun start run tasks.json
 
 | Field                            | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `exposureLimit`                  | The most, in ETH, all live bids may commit together.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `pollSeconds`                    | How often every task is re-checked (at least 5).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `exposureLimit`                  | The most, in ETH, all live bids may commit together; a GONDI and an OpenSea bid on one collection count once (see "OpenSea bids").                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `resaleLimit`                    | The most, in ETH, the `resaleBid` offers may commit together, apart from `exposureLimit` (needed with any `resaleBid`).                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `pollSeconds`                    | How often every task is re-checked (at least 5). Orders are refreshed at least two intervals before they expire, so they never lapse between rounds.                                                                                                                                                                                                                                                                                                                                                                                             |
 | `lossLimits`                     | `{ "dailyUsd", "weeklyUsd", "since" }`: stop bidding once the loss reaches either cap (optional; see "Loss limits" below).                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `wrapEth`                        | `{ "keepEth": "0.05" }`: wrap ETH into WETH when the bids are short of it, keeping that much ETH for gas (optional; see "Wrapping ETH" below).                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `tasks[].enabled`                | `false` keeps the task in the file without running it: it places nothing, and bids it left stay up until they expire or are cancelled (default `true`).                                                                                                                                                                                                                                                                                                                                                                                          |
-| `tasks[].kind`                   | `collectionBid` (a bid any item of the collection can fill) or `listing` (below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `tasks[].venue`                  | `collectionBid` only: `gondi` (the default) or `opensea` (see "OpenSea bids" below).                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `tasks[].kind`                   | `collectionBid` (a bid any item of the collection can fill), `traitBid` (a bid any item with one trait can fill, see "Trait bids" below) or `listing` (below).                                                                                                                                                                                                                                                                                                                                                                                   |
+| `tasks[].venue`                  | `collectionBid` only: `gondi` (the default) or `opensea` (see "OpenSea bids" below). A `traitBid` is posted on GONDI.                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `tasks[].collection`             | The collection's slug, as in its GONDI or OpenSea URL.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `tasks[].trait`                  | `traitBid` only: `{ "type": "Background", "value": "Blue" }`, the trait as the collection's metadata names it, matched exactly.                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `tasks[].tokenId`                | `listing` only: the item's token id, as a string; leave it out to list every item of the collection the wallet holds.                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `tasks[].pricing`                | `{ "mode": "fixed", "price": "1.5" }`, `{ "mode": "floor", "percent": 90 }`, `{ "mode": "floor", "steps": 1 }` (that many price steps under the floor: 1 is the highest bid still below the cheapest listing), `{ "mode": "outbid", "steps": 1 }` (best competing collection bid plus that many price steps), or `{ "mode": "outbid", "percent": 0.5 }` (that bid plus 0.5%, rounded up onto the price step and at least one step above it); or `{ "mode": "level", "level": 5 }` (the fifth highest competing price, see "OpenSea bids" below). |
 | `tasks[].minPrice` / `maxPrice`  | Hard limits in ETH; the bid never leaves them.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `tasks[].quantity`               | How many items the bid may buy (default 1).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `tasks[].expirationMinutes`      | Bid lifetime; refreshed before it ends (default 60, at least 15).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `tasks[].expirationMinutes`      | Bid lifetime; refreshed before it ends (default 60, at least 10).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `tasks[].haltOnFloorMovePercent` | Stop the task when the floor moves this much from where it started.                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `tasks[].maxFloorPercent`        | Never bid above this share of the floor, and do not bid without a floor (optional).                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `tasks[].maxItems`               | Keep bidding after a fill while the wallet holds fewer than this many items of the collection (optional).                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `tasks[].maxItems`               | Keep bidding after a fill while the wallet holds fewer than this many items the bid can fill with: of the collection, or with the trait (optional).                                                                                                                                                                                                                                                                                                                                                                                              |
 | `tasks[].maxHeldValue`           | Keep bidding after a fill while the items held, valued at the floor, plus the live bid stay within this many ETH (optional).                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `tasks[].ladder`                 | `collectionBid` only: `{ "offers": 5, "spacing": "0.02" }` keeps that many offers live, the others on the multiples of `spacing` ETH below the top one (optional, at most 10; see "Ladders" below).                                                                                                                                                                                                                                                                                                                                              |
+| `tasks[].ladder`                 | `{ "offers": 5, "spacing": "0.02" }` keeps that many offers live, the others on the multiples of `spacing` ETH from one spacing below the top one (optional, at most 10; see "Ladders" below).                                                                                                                                                                                                                                                                                                                                                   |
+| `tasks[].resaleBid`              | `{ "marginPercent": 2 }`: while the task would wait on `maxItems`, `maxHeldValue` or `exposureLimit`, keep one offer up that the collection's `bidExit` can resell at once at that margin (optional; see "Resale bids" below).                                                                                                                                                                                                                                                                                                                   |
 
 Without `maxItems`, a task stops for good once its bids have bought `quantity` items; a partly
 filled bid keeps bidding for what it has left. With `maxItems`, a fill does not stop it: the task
@@ -116,9 +119,10 @@ price levels of the book:
 "ladder": { "offers": 4, "spacing": "0.02" }
 ```
 
-The top offer sits at the price `pricing` sets, as without a ladder. The others sit on the next
-multiples of `spacing` below it, rounded down onto the marketplace's price step, and none goes under
-`minPrice`: a top of 2.013 with that ladder bids 2.013, 2.00, 1.98 and 1.96. Since the lower offers
+The top offer sits at the price `pricing` sets, as without a ladder. The others sit on the multiples
+of `spacing` from at least one spacing below it, rounded down onto the marketplace's price step, and
+none goes under `minPrice`: a top of 2.013 with that ladder bids 2.013, 1.98, 1.96 and 1.94, so the
+wallet never holds the top two prices of the book by itself. Since the lower offers
 stay on the same multiples while the top moves within one spacing, such a move replaces only the top
 offer. Each offer buys what the task still wants (`quantity`, after `maxItems` and `maxHeldValue`).
 
@@ -128,6 +132,32 @@ has a cost: several offers can fill within one round, before the next one counts
 holds, so a ladder can buy up to `offers` × `quantity` items before `quantity`, `maxItems` or
 `maxHeldValue` stops it. Each fill spends WETH, so an offer the balance no longer covers simply fails
 to fill.
+
+### Resale bids
+
+A task that holds its `maxItems`, or waits on `maxHeldValue` or `exposureLimit`, withdraws its bids.
+With `resaleBid`, it keeps one offer for one item up instead, priced so the collection's `bidExit`
+can sell the item again at once at a profit:
+
+```json
+"resaleBid": { "marginPercent": 2 }
+```
+
+The price is what selling into the best other wallet's collection bid pays (GONDI or OpenSea, its
+royalties and fees taken out, as `bidExit` reads it), less the sale's gas at the current price,
+divided by 1 + `marginPercent`% (default 2), rounded down onto the price step, kept one step under
+the floor and within `maxPrice`. A seller takes the highest bid, so the offer only fills when it
+beats every other bid on its own venue while the best bid elsewhere pays more: a GONDI offer priced
+off a higher OpenSea bid, for example. Once it fills, `bidExit` sells the item at once, as it does
+any item worth more than it cost.
+
+The offer counts against the file's `resaleLimit` rather than `exposureLimit`, and the file needs
+a listing with `bidExit` on the collection. A collection keeps one resale offer however many bid
+tasks it has, and none while the wallet holds more than when the offer went up, or more than
+`maxItems` (an item a resale offer bought is not sold yet; a restart keeps only the `maxItems`
+check), once its `bidExit` has tried its `maxPerDay` sales today, while gas is over
+`bidExit`'s `maxGasGwei`, at a loss cap, or on a crossed book. The desktop app ignores `bidExit`, so
+it keeps no resale offers either.
 
 ### Loss limits
 
@@ -169,18 +199,34 @@ A listing sells for ETH, but bids spend WETH, so after a sale the bids can be le
 
 Each round, after the loss and before the bids, the bot reads the wallet's ETH and WETH. When the
 WETH is under `exposureLimit`, it wraps the ETH over `keepEth` (up to what reaches `exposureLimit`)
-and waits for that transaction to be mined, so the round's bids already see the WETH. A wrap under
+and waits for that transaction to be mined, so the round's bids already see the WETH. `keepEth` must be
+above 0, since the wrap itself needs ETH for gas. A wrap under
 0.01 ETH is skipped, as its gas would cost more than it adds. Each wrap, and each one that fails, is
 logged; a failed wrap leaves the bids waiting on the WETH they lack until a later round wraps.
 While the wallet has a transaction sent but not yet mined, such as a wrap that timed out, no round
 wraps again, so a slow wrap is never doubled. The desktop app ignores `wrapEth`.
 
-This is the one transaction the bot sends on its own, and only with `wrapEth` in the file. Without
-it, wrap by hand (this sends a transaction):
+The bot sends a transaction on its own only with `wrapEth` in the file, or a listing's `bidExit`
+(see "Selling into other bids"); a listing's `openSeaListing` and `loanOffer` only sign. Without `wrapEth`, wrap by hand (this sends a transaction):
 
 ```bash
 MARKET_MAKER_PRIVATE_KEY=0x... bun start wrap 1.5
 ```
+
+### Swapping USDC into WETH
+
+`swap-usdc` turns the wallet's USDC into WETH for the bids, on Uniswap's 0.05% USDC/WETH pool.
+Without `send` it only prints the quote and the least WETH it would accept; with `send` it swaps,
+approving the router for exactly that amount of USDC first when needed (up to two transactions):
+
+```bash
+MARKET_MAKER_PRIVATE_KEY=0x... bun start swap-usdc 4000
+MARKET_MAKER_PRIVATE_KEY=0x... bun start swap-usdc 4000 send
+```
+
+The least it accepts is what GONDI's ETH price says the USDC is worth, less 1%, so a pool pushed
+against the swap cannot lower it: it refuses a quote under that, and the swap reverts if it would
+pay less. It also refuses while gas is over 30 gwei.
 
 ## Listings
 
@@ -205,6 +251,10 @@ A `listing` task sells one ERC-721 item for ETH:
 | `pricing`               | `{ "mode": "fixed", "price": "2.5" }`, `{ "mode": "floor", "percent": 105 }` (a share of the cheapest other listing in the collection), or `{ "mode": "undercut", "amount": "0.01" }` (that listing minus that many ETH; `maxPrice` when nothing else is listed). |
 | `minPrice` / `maxPrice` | Hard limits in ETH; the item is never listed outside them. `minPrice` must be above 0.                                                                                                                                                                            |
 | `expirationMinutes`     | Listing lifetime; listed again before it ends (default and minimum 5).                                                                                                                                                                                            |
+| `decay`                 | `{ "percent": 5, "everyHours": 6 }` lowers the `pricing` price 5% every 6 hours the bot has been listing the item, down to `minPrice` (optional; see "Lowering the price over time" below).                                                                       |
+| `bidExit`               | Without `tokenId` only: also sell held items into the best collection bid on GONDI or OpenSea, with a transaction (optional; see "Selling into other bids" below).                                                                                                |
+| `openSeaListing`        | Without `tokenId` only: also list held items on OpenSea, above their GONDI price, with no transaction (optional; see "Listing on OpenSea too" below).                                                                                                             |
+| `loanOffer`             | Without `tokenId` only: also offer a loan against each listed item, so a buyer can buy it now and pay later, with no transaction (optional; see "Loans against listed items" below).                                                                              |
 
 Let Seaport move the collection's items once (this one sends a transaction). For a collection
 whose transfers are restricted to an approved operator (ERC721-C), this approves the Seaport
@@ -217,12 +267,40 @@ MARKET_MAKER_PRIVATE_KEY=0x... bun start approve-nft pudgypenguins
 In the desktop app, pick the collection in Settings' collection approval card instead; it asks
 nothing when the collection is already approved.
 
-A listing can only be cancelled on-chain, so the bot never cancels one. To go lower it lists again at
+A GONDI listing can only be cancelled on-chain, so the bot never cancels one. To go lower it lists again at
 the new price and lets the older, dearer listing expire: a buyer takes the cheapest. It never goes
 higher on its own: while a cheaper listing of yours is live, the task waits (`needsOnChainCancel`)
 until that listing expires or you cancel it. Keep `expirationMinutes` short so that wait stays short.
 Required collection royalties are added to the listing as fees. The task stops for good when the
 item sells, and waits while the wallet does not hold the item or Seaport is not approved.
+
+### Lowering the price over time
+
+`decay` lowers what a listing asks the longer it goes unsold, down to `minPrice`:
+
+```json
+{
+  "id": "pudgy-3950",
+  "kind": "listing",
+  "collection": "pudgypenguins",
+  "tokenId": "3950",
+  "pricing": { "mode": "fixed", "price": "3" },
+  "minPrice": "2.2",
+  "maxPrice": "3",
+  "decay": { "percent": 5, "everyHours": 6 }
+}
+```
+
+This lists at 3 ETH, then at 2.85 after 6 hours, 2.7 after 12, and so on until 2.2. The drop is a
+share of what `pricing` asks at the moment, capped at `maxPrice`, so it works with every mode: with
+`{ "mode": "floor", "percent": 110 }` it starts 10% above the cheapest other listing and follows
+that listing as it moves. The price only changes once per step, so each step is one new listing, and
+the dearer one expires as usual.
+
+The clock lives in the bot's memory. It starts when the run first finds the item held: when the bot
+starts, or when an inventory listing picks up an item later. Stopping the bot resets it, so the next
+run lists at the full price again (it waits on `needsOnChainCancel` until the cheaper listing it
+left expires).
 
 ### Listing everything the wallet holds
 
@@ -260,6 +338,133 @@ The bid never pays more than its `maxPrice` and the listing never sells under it
 round trip keeps at least the difference, less royalties and fees. The bot warns at start when a
 listing's `minPrice` is not above the `maxPrice` of a bid on the same collection.
 
+### Selling into other bids
+
+A listing waits for a buyer. When the floor falls while the bot holds items, `bidExit` lets an
+inventory listing (no `tokenId`) sell into the best collection bid of another wallet instead, on
+GONDI or on OpenSea, which takes one transaction per item:
+
+```json
+"bidExit": { "afterHours": 6, "maxLossPercent": 1, "maxPerDay": 2, "maxGasGwei": 30 }
+```
+
+Each round, before listing, the task reads the best collection bid anyone else makes on GONDI's own
+book and, with `OPENSEA_API_KEY`, on OpenSea, and takes the one that pays the seller most: its price
+minus the royalties and fees a sale into it pays (on GONDI, the collection's required royalties and
+GONDI's sale fee). From that it takes the gas of the sale at the current price. For each held item
+it sells:
+
+- at once, when that pays at least what the item cost (a profit);
+- once the item has been held `afterHours` (default 6), when it loses at most `maxLossPercent`
+  (default 1) of what the item cost (a stop loss), and only while the collection's bids can buy no
+  more: every bid task on the collection is halted (disabled, filled, or stopped by a floor move),
+  holds its `maxItems`, or waits on `maxHeldValue` or `lossLimits`, or there is none. A wait on
+  balance, allowance or `exposureLimit` passes, so it does not count. While a bid can still buy,
+  the item is only listed or sold at a profit. Set `maxLossPercent` to 0 to never
+  sell at a loss, such as for a collection the bot holds one item of.
+
+It holds instead while one of the wallet's own bids on the collection is at or above the proceeds,
+which would buy the item back for more than it sold for. It never sells under the listing's
+`minPrice`, more than one item a round, more than `maxPerDay` (default 2) times a UTC day (a failed
+try counts too, so a sale that keeps reverting cannot spend gas all day), while gas costs more than
+`maxGasGwei` (default 30), or while the wallet has a transaction unmined. What an item cost and when
+it was bought come from the fills `lossLimits` reads, so `bidExit` needs `lossLimits`; an item
+bought before its `since` is only listed. Before sending, the bot estimates the sale's gas again and
+sends nothing when the most its gas could cost would leave less than the decision allowed; a sale
+OpenSea builds is also checked to be the one asked for (one item of the collection, for WETH, paid
+to the wallet, asking nothing more than WETH fees). The daily count is kept in memory, so a restart
+starts it again. Each sale, and each one that fails, is logged; an item whose sale fails is listed
+as usual. The desktop app ignores `bidExit`.
+
+A sale into a GONDI bid moves the item through the operator listings use, so the `approve-nft` of
+"Listings" covers it. A sale into an OpenSea offer moves it through OpenSea's conduit, which the
+wallet lets move the collection's items once (this sends a transaction):
+
+```bash
+MARKET_MAKER_PRIVATE_KEY=0x... bun start approve-nft pudgypenguins opensea
+```
+
+The loss caps value a sale with GONDI's sale fee and the collection's required royalties wherever
+it happened, so a sale into an OpenSea offer counts with GONDI's fee rather than OpenSea's.
+
+### Listing on OpenSea too
+
+With `OPENSEA_API_KEY`, `openSeaListing` lists each item an inventory listing (no `tokenId`) holds
+on OpenSea as well, for more buyers, at a price above its GONDI listing, so GONDI stays the cheaper
+place to buy it:
+
+```json
+"openSeaListing": { "markupPercent": 3, "expirationMinutes": 60 }
+```
+
+Each round, after listing on GONDI, the task reads the wallet's OpenSea listings of the collection
+and, for each item, lists it at its cheapest live GONDI listing plus `markupPercent` (default 3,
+up to 100), rounded up to 0.0001 ETH. That is what an OpenSea buyer pays; the wallet receives it
+less the collection's required OpenSea fees. It keeps an OpenSea listing at that price, lists again
+before it expires (it lasts its own `expirationMinutes`, default 60 and at least 15, as cancelling
+it costs nothing, so it needs no short life), and when the GONDI price
+moves, lists at the new price and cancels the older one. Once the item sold anywhere, left the
+wallet, or has no live GONDI listing, its OpenSea listings are cancelled. Listing and cancelling
+are signatures, not transactions: the listings are made on OpenSea's SignedZone, which OpenSea
+cancels without one, but not within about five minutes of listing, so an older listing can stay
+up a few rounds. The bot manages every ETH listing the wallet has on
+OpenSea for the collection, including ones made on OpenSea's site, which sit on the same zone: a
+held item's other listings are cancelled once OpenSea takes it. Only listings outside the
+SignedZone, or for another currency, are left alone. Each listing, cancel and failure is logged; a failure on OpenSea leaves the
+GONDI listings as they are.
+
+Seaport moves the item through OpenSea's conduit, so the wallet lets it move the collection's items
+once, with the `approve-nft <collection> opensea` of "Selling into other bids"; until then each
+OpenSea listing fails with that hint.
+
+### Loans against listed items
+
+`loanOffer` offers a loan against each item an inventory listing (no `tokenId`) lists, so a buyer
+can buy it with GONDI's buy now, pay later: the loan pays most of the price, the buyer pays the
+rest, and the item is the loan's collateral. If the buyer repays, the wallet earns the interest;
+if not, the item comes back to the wallet, which keeps what the buyer paid.
+
+```json
+"loanOffer": { "principalPercent": 90, "aprPercent": 1, "originationFeePercent": 0.25, "durationDays": 3 }
+```
+
+| Field                   | Meaning                                                                                                                               |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `principalPercent`      | The loan, as a share of the item's GONDI listing price (default 90, up to 100).                                                       |
+| `aprPercent`            | The loan's APR (default 1).                                                                                                           |
+| `originationFeePercent` | A fee taken from the principal as the loan starts, as a share of it (default 0.25, up to 10): the buyer pays that much more up front. |
+| `durationDays`          | How long the buyer has to repay: 3 (the default), 5, 7, 10, 15, 20, 45 or a multiple of 30, the durations GONDI takes.                |
+| `expirationMinutes`     | Offer lifetime; signed again before it ends (default and minimum 10).                                                                 |
+
+On a short loan the fee, not the APR, is most of what the wallet earns: 0.25% over 3 days is about a
+30% effective APR, while 1% APR over 3 days is under 0.01% of the principal. Other lenders' offers
+on these collections lend about 85 to 92% of the floor at 1% APR and no fee, for 3 to 7 days, so
+an offer is picked mostly for lending more of the price than theirs.
+
+Each round, after listing on GONDI, the task reads the wallet's loan offers on the collection and,
+for each item, keeps one WETH offer for a single loan against it, at `principalPercent` of its
+cheapest live GONDI listing, at most the listing's `minPrice`, rounded down to 0.01 WETH. When the listing price moves, or the offer
+nears its expiration, it signs a new offer and hides the old one. Once the item sold, left the
+wallet, or has no live GONDI listing, its offers are hidden. A GONDI loan offer cancels only
+on-chain, so hiding only takes it off GONDI's site: its signature still lends until it expires,
+which is why offers last 10 minutes. In that window whoever holds the item next, say the bidder a
+`bidExit` sold it to, could still borrow against it. That is why the loan never exceeds `minPrice`:
+the item never leaves the wallet for less, so nobody can borrow more than they paid for it and
+walk away with the difference. Each offer, hide, wait and failure is logged; a failure
+leaves the GONDI listings as they are, and `cancel-all` hides every offer.
+
+An offer needs the WETH for its loan, and GONDI's loan contract allowed to pull it, or the item
+waits without one. Loans do not count against `exposureLimit`: a loan only starts as the item it
+lends against is bought from the wallet, which is paid the price in the same transaction. Let the
+loan contract spend WETH once (this one sends a transaction):
+
+```bash
+MARKET_MAKER_PRIVATE_KEY=0x... bun start approve-loans 5
+```
+
+A default is not collected by the bot: once a loan is past due, liquidate it on GONDI's site to
+take the item back. The desktop app and `backtest` ignore `loanOffer`.
+
 ### Backtest fills
 
 `backtest` fills the bot's listing from a recorded sale that took a listing at or above its price.
@@ -267,6 +472,41 @@ Its `strict` fills count a buyer within 2% of the floor as one who would have ta
 listing, the cheapest; `loose` counts one within 10%. A listing under the floor reaches as much
 further as it sits under it, for the floor sweepers it draws: 8% under the floor, `strict` counts
 a buyer up to 10% over it.
+
+## Trait bids
+
+A `traitBid` bids on the items of a collection with one trait, on GONDI:
+
+```json
+{
+  "id": "blue-background",
+  "kind": "traitBid",
+  "collection": "pudgypenguins",
+  "trait": { "type": "Background", "value": "Blue" },
+  "pricing": { "mode": "outbid", "steps": 1 },
+  "minPrice": "2",
+  "maxPrice": "2.4",
+  "quantity": 2
+}
+```
+
+It works as a collection bid does, with three things read for the trait:
+
+- **Competing bids** are the other bids on that trait, the OpenSea trait offers GONDI indexes
+  included, and the collection's collection bids: whoever holds an item with the trait can sell it
+  into either, so `outbid` prices above the best of both and `level` joins the levels of both.
+- **The floor** is the cheapest listing of an item with the trait, for `floor` pricing,
+  `maxFloorPercent`, `haltOnFloorMovePercent`, `maxHeldValue` and the crossed-book check, read to
+  the gwei. When that listing is in a currency other than ETH or WETH there is no floor, and
+  whatever needs one waits, as it does with nothing listed.
+- **Items held** are the wallet's items with the trait, for `maxItems` and `maxHeldValue`. They are
+  read from GONDI's index, which trails a purchase by up to a minute, so any item of the collection
+  the wallet holds on-chain but the index does not show yet counts as one with the trait: a fill
+  stops the task at once, and an unrelated purchase only makes it bid less for that minute.
+
+The trait is looked up by name on every round, so a typo fails the task (`unknown trait
+Background: Blu`) while the other tasks run. A trait bid takes one trait; trait offers on OpenSea
+and bids on a single item come later, and a backtest replays collection bids only.
 
 ## OpenSea bids
 
@@ -290,7 +530,11 @@ the bot's name in OpenSea's offer list without leading it:
 `{ "mode": "level", "level": 5 }` bids the fifth highest price anyone else offers on OpenSea, one
 level per distinct price, so four better prices sit above it; it waits (`noPrice`) while fewer than
 five exist. It is still a real offer that fills if the levels above it are taken or withdrawn before
-the next round reprices it, so it counts against `exposureLimit` like any bid. OpenSea refuses an
+the next round reprices it, so it counts against `exposureLimit` like any bid. An OpenSea and a GONDI
+collection bid on the same collection share their WETH there: the pair counts as the larger of the
+two, since `maxItems` counts what the wallet holds of the collection and a fill on either venue
+stops both on the next round. Both can still fill within one round, before that count, so the pair
+can buy one item more than `maxItems` while committing only one bid's WETH. OpenSea refuses an
 offer the wallet's WETH does not cover. The other bid pricing modes work on OpenSea too, against its
 best offer, with 0.01 WETH as the price step: OpenSea refuses an offer off that grid, so a bid
 price is rounded down onto it.

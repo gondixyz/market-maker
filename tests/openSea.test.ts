@@ -1,6 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import type { Gondi } from 'gondi';
-import { type Address, createWalletClient, type Hash, http, recoverTypedDataAddress } from 'viem';
+import {
+  type Address,
+  createWalletClient,
+  type Hash,
+  hashStruct,
+  http,
+  recoverTypedDataAddress,
+  zeroAddress,
+} from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 
@@ -180,7 +188,11 @@ const BUILT = {
  * An `OpenSeaMarket` on a real local key, with the chain and GONDI reads stubbed; `clock.now` is
  * the moment it reads as now.
  */
-const marketWith = (routes: Record<string, unknown>, clock = { now: new Date() }) => {
+const marketWith = (
+  routes: Record<string, unknown>,
+  clock = { now: new Date() },
+  approved = true,
+) => {
   const opensea = fakeOpenSea({
     'collections/boredapeyachtclub': COLLECTION,
     'offers/build': BUILT,
@@ -194,6 +206,7 @@ const marketWith = (routes: Record<string, unknown>, clock = { now: new Date() }
     bcClient: { readContract: async () => 7n },
     currencyBalance: async () => eth('10'),
     currencyAllowance: async () => eth('10'),
+    isApprovedNFTForAll: async () => approved,
   } as unknown as Gondi;
   const gondiApi = {
     collectionMarket: async () => ({ contractAddress: BAYC, floorPrice: eth('6') }),
@@ -205,6 +218,229 @@ const marketWith = (routes: Record<string, unknown>, clock = { now: new Date() }
 };
 
 const SCOPE = { kind: 'collection', slug: 'boredapeyachtclub', venue: 'opensea' } as const;
+
+const ORDER_TYPES = {
+  OrderComponents: [
+    { name: 'offerer', type: 'address' },
+    { name: 'zone', type: 'address' },
+    { name: 'offer', type: 'OfferItem[]' },
+    { name: 'consideration', type: 'ConsiderationItem[]' },
+    { name: 'orderType', type: 'uint8' },
+    { name: 'startTime', type: 'uint256' },
+    { name: 'endTime', type: 'uint256' },
+    { name: 'zoneHash', type: 'bytes32' },
+    { name: 'salt', type: 'uint256' },
+    { name: 'conduitKey', type: 'bytes32' },
+    { name: 'counter', type: 'uint256' },
+  ],
+  OfferItem: [
+    { name: 'itemType', type: 'uint8' },
+    { name: 'token', type: 'address' },
+    { name: 'identifierOrCriteria', type: 'uint256' },
+    { name: 'startAmount', type: 'uint256' },
+    { name: 'endAmount', type: 'uint256' },
+  ],
+  ConsiderationItem: [
+    { name: 'itemType', type: 'uint8' },
+    { name: 'token', type: 'address' },
+    { name: 'identifierOrCriteria', type: 'uint256' },
+    { name: 'startAmount', type: 'uint256' },
+    { name: 'endAmount', type: 'uint256' },
+    { name: 'recipient', type: 'address' },
+  ],
+} as const;
+
+/** A listing as `listings/collection/{slug}/all` lists it: one BAYC for ETH, 1% to OpenSea. */
+const listingJson = ({
+  tokenId = '42',
+  token = BAYC,
+  zone = SIGNED_ZONE,
+  status = 'ACTIVE',
+  offerer = account.address as Address,
+  startTime = '1794349132',
+} = {}) => ({
+  order_hash: ORDER_HASH,
+  protocol_data: {
+    parameters: {
+      offerer,
+      offer: [
+        {
+          itemType: 2,
+          token,
+          identifierOrCriteria: tokenId,
+          startAmount: '1',
+          endAmount: '1',
+        },
+      ],
+      consideration: [
+        {
+          itemType: 0,
+          token: zeroAddress,
+          identifierOrCriteria: '0',
+          startAmount: '9900000000000000000',
+          endAmount: '9900000000000000000',
+          recipient: account.address,
+        },
+        {
+          itemType: 0,
+          token: zeroAddress,
+          identifierOrCriteria: '0',
+          startAmount: '100000000000000000',
+          endAmount: '100000000000000000',
+          recipient: OPENSEA_FEE,
+        },
+      ],
+      startTime,
+      endTime: '1794350932',
+      zone,
+    },
+  },
+  status,
+});
+
+describe('OpenSeaMarket listings', () => {
+  const ITEM = { slug: 'boredapeyachtclub', tokenId: 42n };
+
+  test('posts a listing of the item for ETH, the required fee paid out of it, on the SignedZone', async () => {
+    const { market, requests } = marketWith({
+      'orders/ethereum/seaport/listings': {},
+      'listings/collection/boredapeyachtclub/all': { listings: [] },
+    });
+
+    const placed = await market.placeMirrorListing({
+      scope: ITEM,
+      price: eth('10'),
+      expiration: new Date('2030-01-01T00:00:00Z'),
+    });
+
+    const posted = requests.find(
+      (request) => request.method === 'POST' && request.url === 'orders/ethereum/seaport/listings',
+    )?.body as { parameters: Record<string, unknown>; signature: Hash };
+    const { parameters, signature } = posted;
+    const signer = await recoverTypedDataAddress({
+      domain: { name: 'Seaport', version: '1.6', chainId: 1, verifyingContract: SEAPORT_PROTOCOL },
+      types: ORDER_TYPES,
+      primaryType: 'OrderComponents',
+      message: parameters as never,
+      signature,
+    });
+    expect({
+      signer,
+      id: placed.id,
+      zone: parameters.zone,
+      offer: parameters.offer,
+      paid: (parameters.consideration as { recipient: string; startAmount: string }[]).map(
+        ({ recipient, startAmount }) => [recipient, startAmount],
+      ),
+    }).toEqual({
+      signer: account.address,
+      id: hashStruct({
+        data: parameters as never,
+        primaryType: 'OrderComponents',
+        types: ORDER_TYPES,
+      }),
+      zone: SIGNED_ZONE,
+      offer: [
+        { itemType: 2, token: BAYC, identifierOrCriteria: '42', startAmount: '1', endAmount: '1' },
+      ],
+      paid: [
+        [account.address, eth('9.9').toString()],
+        [OPENSEA_FEE, eth('0.1').toString()],
+      ],
+    });
+  });
+
+  test('lists nothing while OpenSea’s conduit may not move the items', async () => {
+    const { market, requests } = marketWith({}, { now: new Date() }, false);
+
+    const placing = market.placeMirrorListing({
+      scope: ITEM,
+      price: eth('10'),
+      expiration: new Date('2030-01-01T00:00:00Z'),
+    });
+
+    await expect(placing).rejects.toThrow('approve-nft boredapeyachtclub opensea');
+    expect(requests.some((request) => request.method === 'POST')).toBe(false);
+  });
+
+  test('reads the wallet’s SignedZone listings of the collection, at what a buyer pays', async () => {
+    const { market, requests } = marketWith({
+      'listings/collection/boredapeyachtclub/all': {
+        listings: [
+          listingJson(),
+          listingJson({ tokenId: '7', zone: zeroAddress }),
+          listingJson({ tokenId: '8', status: 'CANCELLED' }),
+          listingJson({ tokenId: '9', token: OTHER }),
+          listingJson({ tokenId: '10', offerer: OTHER }),
+        ],
+      },
+    });
+
+    const mirrors = await market.mirrorListings('boredapeyachtclub');
+
+    expect(requests[0].url).toBe(
+      `listings/collection/boredapeyachtclub/all?limit=100&maker=${account.address}`,
+    );
+    expect(mirrors).toEqual([
+      {
+        id: ORDER_HASH,
+        tokenId: 42n,
+        price: eth('10'),
+        expiration: new Date(1794350932 * 1_000),
+        cancellableFrom: new Date((1794349132 + 330) * 1_000),
+      },
+    ]);
+  });
+
+  test('follows every page of the wallet’s listings, and refuses a partial view', async () => {
+    const pages: Request[] = [];
+    const send = (async (url: string) => {
+      pages.push({ url, method: 'GET', headers: {}, body: undefined });
+      const cursor = new URL(url).searchParams.get('next');
+      const page = Number(cursor ?? 0);
+      return Response.json({
+        listings: [listingJson({ tokenId: String(page) })],
+        next: page < limit ? String(page + 1) : null,
+      });
+    }) as unknown as typeof fetch;
+    let limit = 2;
+    const api = new OpenSeaApi('test-key', send);
+
+    const listings = await api.ownListings('boredapeyachtclub', account.address);
+    limit = 20;
+
+    expect(
+      listings.map((listing) => listing.protocol_data.parameters.offer[0].identifierOrCriteria),
+    ).toEqual(['0', '1', '2']);
+    await expect(api.ownListings('boredapeyachtclub', account.address)).rejects.toThrow(
+      'over 10 pages',
+    );
+  });
+
+  test('counts a listing it posted until OpenSea shows it, and cancels it with a signature', async () => {
+    const { market, requests } = marketWith({
+      'orders/ethereum/seaport/listings': {},
+      'listings/collection/boredapeyachtclub/all': { listings: [] },
+      [`orders/chain/ethereum/protocol/${SEAPORT_PROTOCOL}`]: {},
+    });
+    const placed = await market.placeMirrorListing({
+      scope: ITEM,
+      price: eth('10'),
+      expiration: new Date('2030-01-01T00:00:00Z'),
+    });
+
+    const beforeCancel = await market.mirrorListings('boredapeyachtclub');
+    await market.cancelMirrorListings(beforeCancel);
+    const afterCancel = await market.mirrorListings('boredapeyachtclub');
+
+    const cancel = requests.find((request) => request.url.endsWith('/cancel'));
+    expect([beforeCancel.map((mirror) => mirror.id), afterCancel, cancel?.url]).toEqual([
+      [placed.id],
+      [],
+      `orders/chain/ethereum/protocol/${SEAPORT_PROTOCOL}/${placed.id}/cancel`,
+    ]);
+  });
+});
 
 describe('OpenSeaMarket', () => {
   test('posts an offer the wallet signed, paying the required fee out of its WETH', async () => {

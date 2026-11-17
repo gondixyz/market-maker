@@ -11,9 +11,11 @@ const decide = (overrides: Partial<ReconcileInput> = {}) =>
     task: taskOf(),
     snapshot: snapshotOf(),
     now: NOW,
+    pollSeconds: 15,
     referenceFloor: eth('10'),
     exposureAvailable: eth('100'),
     lossLimitReached: false,
+    resalePrice: null,
     ...overrides,
   });
 
@@ -56,6 +58,15 @@ describe('reconcile', () => {
       place: [{ price: eth('8.01'), quantity: 1 }],
       cancel: [bid],
     });
+  });
+
+  test.each([
+    ['keeps a bid with 10 minutes left at the default poll interval', 15, 0],
+    ['refreshes a bid with 10 minutes left when the next round is 10 minutes away', 600, 1],
+  ] as const)('%s', (_name, pollSeconds, placed) => {
+    const bid = bidOf({ expiration: new Date(NOW.getTime() + 10 * 60_000) });
+    const decision = decide({ snapshot: snapshotOf({ ownBids: [bid] }), pollSeconds });
+    expect(decision.type === 'bid' && decision.place.length).toBe(placed);
   });
 
   test('keeps the newest bid and withdraws older duplicates', () => {
@@ -369,8 +380,8 @@ describe('reconcile with a bid the marketplace will not cancel yet', () => {
 describe('reconcile a ladder of offers', () => {
   const task = taskOf({ ladder: { offers: 3, spacing: '0.5' } });
   const top = bidOf({ id: 'top', price: eth('8.01') });
-  const middle = bidOf({ id: 'middle', price: eth('8') });
-  const bottom = bidOf({ id: 'bottom', price: eth('7.5') });
+  const middle = bidOf({ id: 'middle', price: eth('7.5') });
+  const bottom = bidOf({ id: 'bottom', price: eth('7') });
 
   test('places every offer of the ladder', () => {
     expect(decide({ task })).toEqual({
@@ -378,8 +389,8 @@ describe('reconcile a ladder of offers', () => {
       keep: [],
       place: [
         { price: eth('8.01'), quantity: 1 },
-        { price: eth('8'), quantity: 1 },
         { price: eth('7.5'), quantity: 1 },
+        { price: eth('7'), quantity: 1 },
       ],
       cancel: [],
     });
@@ -411,7 +422,7 @@ describe('reconcile a ladder of offers', () => {
     expect(decide({ task, snapshot })).toEqual({
       type: 'bid',
       keep: [top, middle],
-      place: [{ price: eth('7.5'), quantity: 1 }],
+      place: [{ price: eth('7'), quantity: 1 }],
       cancel: [expiring],
     });
   });
@@ -463,10 +474,80 @@ describe('reconcile a ladder of offers', () => {
       type: 'bid',
       keep: [locked],
       place: [
-        { price: eth('8'), quantity: 1 },
         { price: eth('7.5'), quantity: 1 },
+        { price: eth('7'), quantity: 1 },
       ],
       cancel: [],
+    });
+  });
+});
+
+describe('reconcile with a resale price', () => {
+  const task = taskOf({ maxItems: 2 });
+  const full = snapshotOf({ held: 2 });
+
+  test('keeps one offer for one item at the resale price instead of waiting on maxItems', () => {
+    expect(decide({ task, snapshot: full, resalePrice: eth('7') })).toEqual({
+      type: 'resale',
+      reason: 'maxItemsHeld',
+      price: eth('7'),
+      keep: [],
+      place: [{ price: eth('7'), quantity: 1 }],
+      cancel: [],
+    });
+  });
+
+  test('keeps a resale offer already at the price', () => {
+    const bid = bidOf({ price: eth('7') });
+    const snapshot = snapshotOf({ held: 2, ownBids: [bid] });
+    expect(decide({ task, snapshot, resalePrice: eth('7') })).toMatchObject({
+      type: 'resale',
+      keep: [bid],
+      place: [],
+      cancel: [],
+    });
+  });
+
+  test.each([
+    ['maxHeldValue', { task: taskOf({ maxHeldValue: '10' }), snapshot: snapshotOf({ held: 1 }) }],
+    ['exposureLimit', { exposureAvailable: eth('1') }],
+  ] as const)('stands in for a wait on %s', (reason, overrides) => {
+    expect(decide({ ...overrides, resalePrice: eth('7') })).toMatchObject({
+      type: 'resale',
+      reason,
+    });
+  });
+
+  test('ignores the resale price while the task can bid as usual', () => {
+    expect(decide({ task, resalePrice: eth('7') }).type).toBe('bid');
+  });
+
+  test.each([
+    ['at a loss cap', { lossLimitReached: true }, 'lossLimit'],
+    [
+      'on a crossed book',
+      { snapshot: snapshotOf({ held: 2, floorPrice: eth('7') }) },
+      'crossedBook',
+    ],
+    [
+      'when the WETH does not cover it',
+      { snapshot: snapshotOf({ held: 2, balance: eth('6') }) },
+      'maxItemsHeld',
+    ],
+  ] as const)('still waits %s', (_name, overrides, reason) => {
+    expect(decide({ task, snapshot: full, resalePrice: eth('7'), ...overrides })).toMatchObject({
+      type: 'wait',
+      reason,
+    });
+  });
+
+  test('withdraws the ladder before placing the resale offer', () => {
+    const bid = bidOf();
+    const snapshot = snapshotOf({ held: 2, ownBids: [bid] });
+    expect(decide({ task, snapshot, resalePrice: eth('7') })).toMatchObject({
+      type: 'resale',
+      place: [{ price: eth('7'), quantity: 1 }],
+      cancel: [bid],
     });
   });
 });

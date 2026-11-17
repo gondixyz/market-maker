@@ -1,5 +1,5 @@
 import { VENUES } from '../../engine/market';
-import { INVOKE_CHANNELS } from '../api';
+import { type DesktopApi, INVOKE_CHANNELS } from '../api';
 import type { DesktopController } from './controller';
 
 /** The part of Electron's `ipcMain` the handlers use; tests pass a recorder. */
@@ -7,9 +7,30 @@ export type HandlerRegistry = {
   handle(channel: string, listener: (event: unknown, ...args: unknown[]) => unknown): void;
 };
 
+/** The app's own update check, outside the controller since it touches neither key nor bot. */
+export type UpdateHandlers = Pick<DesktopApi, 'availableUpdate' | 'openLatestRelease'>;
+
+/** Anonymous usage statistics, outside the controller since they touch neither key nor bot. */
+export type UsageStatisticsHandlers = Pick<
+  DesktopApi,
+  'usageStatistics' | 'setUsageStatistics' | 'acknowledgeUsageNotice'
+>;
+
 const asString = (value: unknown) => {
   if (typeof value !== 'string') throw new Error('expected a string argument');
   return value;
+};
+
+const asBoolean = (value: unknown) => {
+  if (typeof value !== 'boolean') throw new Error('expected a boolean argument');
+  return value;
+};
+
+/** A trait bid's `{ type, value }`, or `undefined` for none. */
+const asTrait = (value: unknown) => {
+  if (value === undefined) return undefined;
+  const { type, value: name } = (value ?? {}) as { type?: unknown; value?: unknown };
+  return { type: asString(type), value: asString(name) };
 };
 
 const asVenue = (value: unknown) => {
@@ -19,10 +40,15 @@ const asVenue = (value: unknown) => {
 };
 
 /**
- * Binds each `INVOKE_CHANNELS` channel to its controller method, checking the arguments the few
+ * Binds each `INVOKE_CHANNELS` channel to its controller, update or usage statistics method, checking the arguments the few
  * calls that take any receive. Nothing else is reachable over IPC.
  */
-export const registerHandlers = (ipc: HandlerRegistry, controller: DesktopController) => {
+export const registerHandlers = (
+  ipc: HandlerRegistry,
+  controller: DesktopController,
+  updates: UpdateHandlers,
+  usage: UsageStatisticsHandlers,
+) => {
   ipc.handle(INVOKE_CHANNELS.status, () => controller.status());
   ipc.handle(INVOKE_CHANNELS.importKey, (_event, privateKey) =>
     controller.importKey(asString(privateKey)),
@@ -40,8 +66,11 @@ export const registerHandlers = (ipc: HandlerRegistry, controller: DesktopContro
   ipc.handle(INVOKE_CHANNELS.searchCollections, (_event, query) =>
     controller.searchCollections(asString(query)),
   );
-  ipc.handle(INVOKE_CHANNELS.collectionPricing, (_event, slug, venue) =>
-    controller.collectionPricing(asString(slug), asVenue(venue)),
+  ipc.handle(INVOKE_CHANNELS.collectionPricing, (_event, slug, venue, trait) =>
+    controller.collectionPricing(asString(slug), asVenue(venue), asTrait(trait)),
+  );
+  ipc.handle(INVOKE_CHANNELS.collectionTraits, (_event, slug) =>
+    controller.collectionTraits(asString(slug)),
   );
   ipc.handle(INVOKE_CHANNELS.cancelAllListings, () => controller.cancelAllListings());
   ipc.handle(INVOKE_CHANNELS.approveWeth, (_event, amount, venue) =>
@@ -62,4 +91,11 @@ export const registerHandlers = (ipc: HandlerRegistry, controller: DesktopContro
   ipc.handle(INVOKE_CHANNELS.removeOpenSeaKey, () => controller.removeOpenSeaKey());
   ipc.handle(INVOKE_CHANNELS.saveRpcUrl, (_event, url) => controller.saveRpcUrl(asString(url)));
   ipc.handle(INVOKE_CHANNELS.removeRpcUrl, () => controller.removeRpcUrl());
+  ipc.handle(INVOKE_CHANNELS.availableUpdate, () => updates.availableUpdate());
+  ipc.handle(INVOKE_CHANNELS.openLatestRelease, () => updates.openLatestRelease());
+  ipc.handle(INVOKE_CHANNELS.usageStatistics, () => usage.usageStatistics());
+  ipc.handle(INVOKE_CHANNELS.setUsageStatistics, (_event, enabled) =>
+    usage.setUsageStatistics(asBoolean(enabled)),
+  );
+  ipc.handle(INVOKE_CHANNELS.acknowledgeUsageNotice, () => usage.acknowledgeUsageNotice());
 };

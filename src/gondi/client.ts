@@ -83,22 +83,24 @@ export type CollectionApproval = { contractAddress: Address; operator: Address; 
 
 /**
  * The operator the wallet approves so the `slug` collection's items can be listed on GONDI, as
- * `approvalOperator` resolves it from the collection's Seaport conduit key, and whether the
+ * `approvalOperator` resolves it from the collection's Seaport conduit key, or `operator` when
+ * given (OpenSea's conduit, which sales into OpenSea offers move items through), and whether the
  * client's wallet has approved it already.
  */
 export const collectionApproval = async (
   gondi: Gondi,
   api: Pick<GondiApi, 'collectionMarket'>,
   slug: string,
+  operator?: Address,
 ): Promise<CollectionApproval> => {
   const { contractAddress, seaportConduitKey } = await api.collectionMarket({ slug });
-  const operator = await approvalOperator(gondi, seaportConduitKey);
+  const approvedOperator = operator ?? (await approvalOperator(gondi, seaportConduitKey));
   const approved = await gondi.isApprovedNFTForAll({
     nftAddress: contractAddress,
     standard: 'ERC721',
-    to: operator,
+    to: approvedOperator,
   });
-  return { contractAddress, operator, approved };
+  return { contractAddress, operator: approvedOperator, approved };
 };
 
 /** The name a confirmation shows for a collection's operator: Seaport, OpenSea's conduit, or its address. */
