@@ -1,8 +1,9 @@
+import { percentOf } from './basisPoints';
 import type { ListingSnapshot, OwnListing } from './market';
 import type { ListingPricingRule, ListingTask } from './task';
 
-const BPS = 10_000n;
 const MINIMUM_REFRESH_MARGIN_MS = 2 * 60_000;
+const HOUR_MS = 60 * 60_000;
 
 export type ListingWaitReason =
   | 'noPrice'
@@ -30,7 +31,23 @@ export type ListingDecision =
   | { type: 'wait'; reason: ListingWaitReason; listing?: OwnListing }
   | { type: 'halt'; reason: 'filled' };
 
-export type DecideListingInput = { task: ListingTask; snapshot: ListingSnapshot; now: Date };
+export type DecideListingInput = {
+  task: ListingTask;
+  snapshot: ListingSnapshot;
+  now: Date;
+  /** The pause between two rounds, which the refresh margin must outlast. */
+  pollSeconds: number;
+  /** When this run first found the item held: the start of the task's `decay`. */
+  listedSince: Date;
+};
+
+/**
+ * How long before its expiration an order is placed again: a share of its lifetime, at least two
+ * minutes, and at least two poll intervals, so a round that comes `pollSeconds` late, plus however
+ * long the round itself takes, still finds the order live and refreshes it before it lapses.
+ */
+export const refreshMarginMs = (expirationMinutes: number, pollSeconds: number) =>
+  Math.max(MINIMUM_REFRESH_MARGIN_MS, expirationMinutes * 6_000, 2 * pollSeconds * 1_000);
 
 const ruleListingPrice = (
   rule: ListingPricingRule,
@@ -43,7 +60,7 @@ const ruleListingPrice = (
     case 'floor':
       return snapshot.lowestCompetingAsk === null
         ? null
-        : (snapshot.lowestCompetingAsk * BigInt(Math.round(rule.percent * 100))) / BPS;
+        : percentOf(snapshot.lowestCompetingAsk, rule.percent);
     case 'undercut':
       return snapshot.lowestCompetingAsk === null
         ? maxPrice
@@ -52,33 +69,54 @@ const ruleListingPrice = (
 };
 
 /**
- * The price the listing should sit at now: the task's rule held within `minPrice`–`maxPrice`, or
- * `null` when the rule has nothing to price from. Not rounded: listings are not price-stepped.
+ * `price` less the task's `decay`: `percent` of it for each full `everyHours` since `listedSince`,
+ * so the price steps down rather than drifting every round, which would list again each round.
+ * Unchanged without `decay`; at most the whole price, which `minPrice` then holds up.
  */
-export const targetListingPrice = (task: ListingTask, snapshot: ListingSnapshot): bigint | null => {
-  const rulePrice = ruleListingPrice(task.pricing, snapshot, task.maxPrice);
-  if (rulePrice === null) return null;
-  return rulePrice < task.minPrice
-    ? task.minPrice
-    : rulePrice > task.maxPrice
-      ? task.maxPrice
-      : rulePrice;
+export const decayedListingPrice = (
+  price: bigint,
+  decay: ListingTask['decay'],
+  listedSince: Date,
+  now: Date,
+) => {
+  if (!decay) return price;
+  const elapsedSteps = Math.floor(
+    Math.max(0, now.getTime() - listedSince.getTime()) / (decay.everyHours * HOUR_MS),
+  );
+  return price - percentOf(price, Math.min(100, elapsedSteps * decay.percent));
 };
 
-const needsRefresh = (listing: OwnListing, task: ListingTask, now: Date) => {
-  const margin = Math.max(MINIMUM_REFRESH_MARGIN_MS, task.expirationMinutes * 6_000);
-  return listing.expiration.getTime() - now.getTime() <= margin;
+/**
+ * The price the listing should sit at now: the task's rule capped at `maxPrice`, lowered by its
+ * `decay`, and held up at `minPrice`; or `null` when the rule has nothing to price from. Not
+ * rounded: listings are not price-stepped.
+ */
+export const targetListingPrice = (
+  task: ListingTask,
+  snapshot: ListingSnapshot,
+  listedSince: Date,
+  now: Date,
+): bigint | null => {
+  const rulePrice = ruleListingPrice(task.pricing, snapshot, task.maxPrice);
+  if (rulePrice === null) return null;
+  const capped = rulePrice > task.maxPrice ? task.maxPrice : rulePrice;
+  const decayed = decayedListingPrice(capped, task.decay, listedSince, now);
+  return decayed < task.minPrice ? task.minPrice : decayed;
 };
+
+const needsRefresh = (listing: OwnListing, task: ListingTask, now: Date, pollSeconds: number) =>
+  listing.expiration.getTime() - now.getTime() <=
+  refreshMarginMs(task.expirationMinutes, pollSeconds);
 
 /**
  * Whether a buyer can still take the listing. The API can keep an order `Active` long after its
  * expiration, which Seaport no longer fills, so the expiration decides too.
  */
-const isLive = (listing: OwnListing, now: Date) =>
+export const isLive = (listing: OwnListing, now: Date) =>
   listing.active && listing.expiration.getTime() > now.getTime();
 
 /** The live listing a buyer would take: the cheapest, and of those the one that lasts longest. */
-const cheapestListing = (listings: OwnListing[]) =>
+export const cheapestListing = (listings: OwnListing[]) =>
   [...listings].sort((first, second) =>
     first.price === second.price
       ? second.expiration.getTime() - first.expiration.getTime()
@@ -94,7 +132,13 @@ const cheapestListing = (listings: OwnListing[]) =>
  * expire; a higher target than a live listing waits for the user, since only an on-chain cancel
  * removes the cheaper one. A listing past its expiration is not live, whatever its status says.
  */
-export const decideListing = ({ task, snapshot, now }: DecideListingInput): ListingDecision => {
+export const decideListing = ({
+  task,
+  snapshot,
+  now,
+  pollSeconds,
+  listedSince,
+}: DecideListingInput): ListingDecision => {
   if (snapshot.ownListings.some((listing) => listing.executions > 0)) {
     return { type: 'halt', reason: 'filled' };
   }
@@ -103,12 +147,14 @@ export const decideListing = ({ task, snapshot, now }: DecideListingInput): List
   if (isCrossed(snapshot.lowestCompetingAsk, snapshot.bestCompetingBid)) {
     return { type: 'wait', reason: 'crossedBook' };
   }
-  const price = targetListingPrice(task, snapshot);
+  const price = targetListingPrice(task, snapshot, listedSince, now);
   if (price === null) return { type: 'wait', reason: 'noPrice' };
   const live = cheapestListing(snapshot.ownListings.filter((listing) => isLive(listing, now)));
   if (!live || price < live.price) return { type: 'place', price };
   if (price > live.price) return { type: 'wait', reason: 'needsOnChainCancel', listing: live };
-  return needsRefresh(live, task, now) ? { type: 'place', price } : { type: 'keep', listing: live };
+  return needsRefresh(live, task, now, pollSeconds)
+    ? { type: 'place', price }
+    : { type: 'keep', listing: live };
 };
 
 /**
@@ -121,9 +167,17 @@ export const decideInventoryItem = ({
   task,
   snapshot,
   now,
+  pollSeconds,
+  listedSince,
 }: DecideListingInput): Exclude<ListingDecision, { type: 'halt' }> | null => {
   if (!snapshot.owned) return null;
   const ownListings = snapshot.ownListings.filter((listing) => isLive(listing, now));
-  const decision = decideListing({ task, snapshot: { ...snapshot, ownListings }, now });
+  const decision = decideListing({
+    task,
+    snapshot: { ...snapshot, ownListings },
+    now,
+    pollSeconds,
+    listedSince,
+  });
   return decision.type === 'halt' ? null : decision;
 };

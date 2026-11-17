@@ -1,7 +1,6 @@
+import { basisPoints, BPS, percentOf } from './basisPoints';
 import type { BidSnapshot } from './market';
 import type { BidTask, PricingRule } from './task';
-
-const BPS = 10_000n;
 
 const floorToStep = (price: bigint, step: bigint) => (step > 0n ? price - (price % step) : price);
 
@@ -9,11 +8,6 @@ const ceilToStep = (price: bigint, step: bigint) => {
   const floored = floorToStep(price, step);
   return floored === price ? price : floored + step;
 };
-
-const basisPoints = (percent: number) => BigInt(Math.round(percent * 100));
-
-/** `percent` of `amount`, rounded down to the wei. */
-const percentOf = (amount: bigint, percent: number) => (amount * basisPoints(percent)) / BPS;
 
 /**
  * `percent` above the best competing bid, rounded up onto the step so rounding never takes it
@@ -82,7 +76,7 @@ export const targetBidPrice = (task: BidTask, snapshot: BidSnapshot): bigint | n
 
 /**
  * The prices a task's offers should sit at now, best first: the `targetBidPrice` and, with a
- * `ladder`, its other offers on the highest multiples of `spacing` strictly below it, rounded down
+ * `ladder`, its other offers on the multiples of `spacing` from at least one spacing below it, rounded down
  * onto the price step, without repeats and none under `minPrice`. Lower offers stay on the same
  * grid while the top price moves within one spacing, so such a move replaces only the top offer.
  * Empty when there is no target price.
@@ -92,7 +86,8 @@ export const ladderPrices = (task: BidTask, snapshot: BidSnapshot): bigint[] => 
   if (top === null) return [];
   if (!task.ladder) return [top];
   const { offers, spacing } = task.ladder;
-  const highestBelowTop = top - 1n - ((top - 1n) % spacing);
+  const oneSpacingBelowTop = top - spacing;
+  const highestBelowTop = oneSpacingBelowTop - (oneSpacingBelowTop % spacing);
   const lowest = ceilToStep(task.minPrice, snapshot.priceStep);
   const lower = Array.from({ length: offers - 1 }, (_, index) =>
     floorToStep(highestBelowTop - BigInt(index) * spacing, snapshot.priceStep),

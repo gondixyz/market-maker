@@ -9,6 +9,7 @@ import {
   powerSaveBlocker,
   safeStorage,
   session,
+  shell,
 } from 'electron';
 import { createPublicClient, http, type LocalAccount } from 'viem';
 
@@ -29,12 +30,14 @@ import { OpenSeaApi } from '../../opensea/api';
 import { OpenSeaMarket } from '../../opensea/market';
 import { STATUS_CHANNEL } from '../api';
 import { collectionPricing } from './collectionPricing';
-import { pickableCollections } from './collections';
+import { collectionTraits, pickableCollections } from './collections';
 import { DesktopController } from './controller';
 import { registerHandlers } from './handlers';
 import { KeyVault, SecretFile, secureStorage } from './keyVault';
 import { walletProfile } from './profile';
 import { TasksStore } from './tasksStore';
+import { sendsUsageStatistics, Telemetry } from './telemetry';
+import { availableUpdate, LATEST_RELEASE_URL } from './update';
 
 /** How long a saved RPC URL has to answer `eth_chainId` before it is refused. */
 const RPC_CHECK_TIMEOUT_MS = 10_000;
@@ -98,6 +101,12 @@ const keepAwake = () => {
  * by the id `start` returned (https://www.electronjs.org/docs/latest/api/power-save-blocker).
  * `ipcMain.handle` answers the preload's `ipcRenderer.invoke` with the handler's resolved value or
  * rejects it with the thrown error (https://www.electronjs.org/docs/latest/api/ipc-main).
+ * `app.getVersion()` is the `version` of the app's `package.json`
+ * (https://www.electronjs.org/docs/latest/api/app#appgetversion), and `shell.openExternal` opens
+ * the fixed release URL in the default browser, outside the sandboxed window
+ * (https://www.electronjs.org/docs/latest/api/shell#shellopenexternalurl-options).
+ * `app.isPackaged` is false under `electron-vite dev`, which therefore sends no usage statistics
+ * (https://www.electronjs.org/docs/latest/api/app#appispackaged-readonly).
  */
 const main = async () => {
   app.enableSandbox();
@@ -117,6 +126,12 @@ const main = async () => {
   const userData = app.getPath('userData');
   const encryption = secureStorage(safeStorage, process.platform);
   const rpcUrlFile = new SecretFile(encryption, join(userData, 'rpc-url.key'));
+  const telemetry = new Telemetry(join(userData, 'telemetry.json'), {
+    appVersion: app.getVersion(),
+    os: process.platform,
+    arch: process.arch,
+    sending: sendsUsageStatistics(app.isPackaged, process.env),
+  });
   const environmentRpcUrl = process.env.MARKET_MAKER_RPC_URL || undefined;
   let rpcUrl = environmentRpcUrl ?? (await rpcUrlFile.read().catch(() => null)) ?? undefined;
   const gondiOf = (account: LocalAccount) => gondiFor(account, chain, rpcUrl);
@@ -154,7 +169,9 @@ const main = async () => {
     allowancesOf: (account) => wethAllowances(gondiOf(account)),
     profileOf: (account) => walletProfile(new GondiApi(), account.address),
     pickableCollections: (searchTerm) => pickableCollections(new GondiApi(), { searchTerm }),
-    collectionPricingOf: (slug, venue) => collectionPricing(new GondiApi(), slug, venue),
+    collectionPricingOf: (slug, venue, trait) =>
+      collectionPricing(new GondiApi(), slug, venue, trait),
+    collectionTraits: (slug) => collectionTraits(new GondiApi(), slug),
     confirm: async (message) => {
       const { response } = await dialog.showMessageBox(window, {
         type: 'warning',
@@ -172,8 +189,22 @@ const main = async () => {
     publish: (status) => {
       if (!window.isDestroyed()) window.webContents.send(STATUS_CHANNEL, status);
     },
+    telemetry: { capture: (event) => void telemetry.capture(event) },
   });
-  registerHandlers(ipcMain, controller);
+  registerHandlers(
+    ipcMain,
+    controller,
+    {
+      availableUpdate: () => availableUpdate(app.getVersion()),
+      openLatestRelease: () => shell.openExternal(LATEST_RELEASE_URL),
+    },
+    {
+      usageStatistics: () => telemetry.usageStatistics(),
+      setUsageStatistics: (enabled) => telemetry.setEnabled(enabled),
+      acknowledgeUsageNotice: () => telemetry.acknowledgeNotice(),
+    },
+  );
+  void telemetry.capture({ event: 'market_maker_app_started' });
 
   let withdrawn = false;
   app.on('before-quit', async (event) => {
@@ -183,6 +214,7 @@ const main = async () => {
     await controller
       .cancelAll()
       .catch((error) => dialog.showErrorBox('Bids not withdrawn', String(error)));
+    await telemetry.flush();
     app.quit();
   });
   app.on('window-all-closed', () => app.quit());

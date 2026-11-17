@@ -1,7 +1,7 @@
 import { BaseError, formatEther, type LocalAccount, maxUint256 } from 'viem';
 
 import { describeLoss, describeTaskState } from '../../engine/describe';
-import { type Market, type Venue, VENUES } from '../../engine/market';
+import { type Market, type Trait, type Venue, VENUES } from '../../engine/market';
 import { Runner, type TaskState } from '../../engine/runner';
 import { bidsOnOpenSea, parsePositiveEther, type TasksFile } from '../../engine/task';
 import {
@@ -23,6 +23,7 @@ import type {
   WalletProfile,
   WethAllowance,
 } from '../api';
+import { runLengthOf, type RunShape, type StartFailure, type TelemetryEvent } from './telemetry';
 
 /** OpenSea API keys are 32 hex characters; this accepts any plausible token without spaces. */
 const OPENSEA_API_KEY = /^[\w-]{16,128}$/;
@@ -85,12 +86,16 @@ export type ControllerDependencies = {
   pickableCollections(searchTerm?: string): Promise<CollectionOption[]>;
   /**
    * The `slug` collection's price step on `venue`, its floor and its top bid (`null` if none,
-   * `undefined` if it could not be read), in wei.
+   * `undefined` if it could not be read), in wei; with a `trait`, the trait's floor and the top bid
+   * an item with it sells into.
    */
   collectionPricingOf(
     slug: string,
     venue: Venue,
+    trait?: Trait,
   ): Promise<{ priceStep: bigint; floor: bigint | null; topBid: bigint | null | undefined }>;
+  /** The traits of the collection `slug` names, each value once. */
+  collectionTraits(slug: string): Promise<Trait[]>;
   /** Asks the user, outside the window, to confirm an on-chain action. */
   confirm(message: string): Promise<boolean>;
   /** Keeps the computer from suspending the app while the bot runs. */
@@ -98,6 +103,40 @@ export type ControllerDependencies = {
   notify(title: string, body: string): void;
   /** Sends the window a fresh status. */
   publish(status: DesktopStatus): void;
+  /** Records an anonymous usage event; it never rejects, and nothing waits for it. */
+  telemetry: { capture(event: TelemetryEvent): unknown };
+};
+
+/** A start refused for something the user has not set up yet, named for the usage statistics. */
+class MissingSetupError extends Error {
+  constructor(
+    readonly reason: Exclude<StartFailure, 'other'>,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * What a run starts with, as the usage statistics count it: the enabled tasks by kind and venue,
+ * and the options it uses, never a collection or a price.
+ */
+export const runShapeOf = (file: TasksFile, customRpc: boolean): RunShape => {
+  const tasks = file.tasks.filter((task) => task.enabled);
+  const count = (matches: (task: TasksFile['tasks'][number]) => boolean) =>
+    tasks.filter(matches).length;
+  const venueOf = (task: TasksFile['tasks'][number]) =>
+    task.kind === 'listing' ? 'gondi' : task.venue;
+  return {
+    collection_bids: count((task) => task.kind === 'collectionBid'),
+    trait_bids: count((task) => task.kind === 'traitBid'),
+    listings: count((task) => task.kind === 'listing'),
+    gondi_tasks: count((task) => venueOf(task) === 'gondi'),
+    opensea_tasks: count((task) => venueOf(task) === 'opensea'),
+    opensea_mirrors: count((task) => task.kind === 'listing' && task.openSeaListing !== undefined),
+    loss_limits: file.lossLimits !== undefined,
+    custom_rpc: customRpc,
+  };
 };
 
 /**
@@ -147,10 +186,23 @@ const isAlert = (state: TaskState, previous: TaskState | undefined) =>
  * these methods one to one. It owns the running `Runner`, and holds the rule that the key and the
  * tasks only change while the bot is stopped.
  */
-export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
+export class DesktopController
+  implements
+    Omit<
+      DesktopApi,
+      | 'onStatus'
+      | 'availableUpdate'
+      | 'openLatestRelease'
+      | 'usageStatistics'
+      | 'setUsageStatistics'
+      | 'acknowledgeUsageNotice'
+    >
+{
   private runner: Runner | undefined;
   private running = false;
   private pendingStart: Promise<DesktopStatus> | undefined;
+  /** When the running bot started, in epoch milliseconds, for its run's length. */
+  private startedAt = 0;
   private address: string | null | undefined;
   private openSeaKeySaved: boolean | undefined;
   private rpcHost: string | null | undefined;
@@ -159,6 +211,7 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
   private collectionOptions: Promise<CollectionOption[]> | undefined;
   /** Each approval sent this session that the window has not yet waited out, by hash. */
   private readonly pendingApprovals = new Map<string, SentApproval>();
+  private readonly traitsBySlug = new Map<string, Promise<Trait[]>>();
 
   constructor(private readonly dependencies: ControllerDependencies) {}
 
@@ -197,6 +250,7 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
     this.address = await this.dependencies.vault.store(privateKey);
     this.forgetRunner();
     this.keyError = null;
+    this.dependencies.telemetry.capture({ event: 'market_maker_wallet_imported' });
     return this.status();
   }
 
@@ -423,10 +477,11 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
     return this.dependencies.pickableCollections(query.trim());
   }
 
-  async collectionPricing(slug: string, venue: Venue): Promise<CollectionPricing> {
+  async collectionPricing(slug: string, venue: Venue, trait?: Trait): Promise<CollectionPricing> {
     const { priceStep, floor, topBid } = await this.dependencies.collectionPricingOf(
       slug.trim(),
       venue,
+      trait,
     );
     return {
       priceStep: formatEther(priceStep),
@@ -435,24 +490,54 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
     };
   }
 
+  /** Read once per collection and session; a failed read is not kept, so the next call tries again. */
+  collectionTraits(slug: string) {
+    const cached = this.traitsBySlug.get(slug);
+    if (cached) return cached;
+    const traits = this.dependencies.collectionTraits(slug).catch((error: unknown) => {
+      this.traitsBySlug.delete(slug);
+      throw error;
+    });
+    this.traitsBySlug.set(slug, traits);
+    return traits;
+  }
+
   async profile(): Promise<WalletProfile> {
     return this.dependencies.profileOf(await this.requireAccount());
   }
 
+  /** Starts the runner, and records the start, or why it was refused, in the usage statistics. */
   private async launch() {
     if (this.running) return this.status();
-    const file = await this.dependencies.tasks.load();
-    const openSeaApiKey = await this.dependencies.openSeaKey.read();
-    if (bidsOnOpenSea(file) && !openSeaApiKey) {
-      throw new Error('add your OpenSea API key to bid on OpenSea');
+    try {
+      const file = await this.dependencies.tasks.load();
+      const openSeaApiKey = await this.dependencies.openSeaKey.read();
+      if (bidsOnOpenSea(file) && !openSeaApiKey) {
+        throw new MissingSetupError(
+          'missing_opensea_key',
+          'add your OpenSea API key to bid on OpenSea',
+        );
+      }
+      const runner = await this.createRunner(file, openSeaApiKey);
+      this.runner?.removeAllListeners();
+      this.runner = runner;
+      runner.start();
+      this.dependencies.keepAwake.start();
+      this.running = true;
+      this.startedAt = Date.now();
+      const status = await this.status();
+      this.dependencies.telemetry.capture({
+        event: 'market_maker_bot_started',
+        properties: runShapeOf(file, status.rpcHost !== null || status.rpcUrlFromEnvironment),
+      });
+      return status;
+    } catch (error) {
+      this.dependencies.telemetry.capture({
+        event: 'market_maker_bot_start_failed',
+        properties: { reason: error instanceof MissingSetupError ? error.reason : 'other' },
+      });
+      throw error;
     }
-    const runner = await this.createRunner(file, openSeaApiKey);
-    this.runner?.removeAllListeners();
-    this.runner = runner;
-    runner.start();
-    this.dependencies.keepAwake.start();
-    this.running = true;
-    return this.status();
   }
 
   private async readAddress() {
@@ -469,13 +554,17 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
   /**
    * Builds a runner over `file`. It refuses nothing about the OpenSea API key: without one, only
    * the OpenSea tasks fail, so cancel-all still withdraws every other task's bids. It drops
-   * `wrapEth`, as the desktop app sends no transaction without a confirmation in main.
+   * `wrapEth` and every listing's `bidExit`, as the desktop app sends no transaction without a
+   * confirmation in main, and every listing's `loanOffer`, which its window cannot show or edit.
    */
   private async createRunner(file: TasksFile, openSeaApiKey: string | null) {
     const account = await this.requireAccount();
     const runner = new Runner(this.dependencies.marketFor(account, openSeaApiKey), {
       ...file,
       wrapEth: undefined,
+      tasks: file.tasks.map((task) =>
+        task.kind === 'listing' ? { ...task, bidExit: undefined, loanOffer: undefined } : task,
+      ),
     });
     const previous = new Map<string, TaskState>();
     runner.on('state', (taskId, state) => {
@@ -494,7 +583,7 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
 
   private async requireAccount() {
     const account = await this.dependencies.vault.account();
-    if (!account) throw new Error('import the bot wallet key first');
+    if (!account) throw new MissingSetupError('no_wallet', 'import the bot wallet key first');
     return account;
   }
 
@@ -506,6 +595,12 @@ export class DesktopController implements Omit<DesktopApi, 'onStatus'> {
   }
 
   private halt() {
+    if (this.running) {
+      this.dependencies.telemetry.capture({
+        event: 'market_maker_bot_stopped',
+        properties: { run_length: runLengthOf(Date.now() - this.startedAt) },
+      });
+    }
     this.dependencies.keepAwake.stop();
     this.running = false;
   }

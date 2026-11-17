@@ -1,10 +1,17 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 
-import { formatEther } from 'viem';
+import { formatEther, parseUnits } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
-import { describeLoss, describeTaskState, describeWrap } from '../engine/describe';
+import {
+  describeExit,
+  describeLend,
+  describeLoss,
+  describeMirror,
+  describeTaskState,
+  describeWrap,
+} from '../engine/describe';
 import type { Venue } from '../engine/market';
 import { metricsText } from '../engine/metrics';
 import { Runner } from '../engine/runner';
@@ -19,9 +26,10 @@ import {
   gondiFor,
   WETH_SPENDER,
 } from '../gondi/client';
-import { GondiMarket } from '../gondi/market';
+import { GondiMarket, MULTI_SOURCE_LOAN, WETH } from '../gondi/market';
 import { parsePriceHistory, recordPriceHistory, serializePriceHistory } from '../gondi/replay';
-import { OpenSeaMarket } from '../opensea/market';
+import { swapUsdcForWeth, USDC_DECIMALS } from '../gondi/swap';
+import { OPENSEA_CONDUIT, OpenSeaMarket } from '../opensea/market';
 import { setOpenSeaProfile } from '../opensea/profile';
 import { chainFrom, openSeaApiFrom, priceApiFrom, privateKeyFrom } from './environment';
 import { pushMetricsEachRound } from './metrics';
@@ -35,6 +43,8 @@ const USAGE = `Usage:
   market-maker approve <amount>         let Seaport spend <amount> WETH (sends a transaction)
   market-maker approve-opensea <amount> let OpenSea's conduit spend <amount> WETH, which OpenSea
                                         bids pay through (sends a transaction)
+  market-maker approve-loans <amount>   let GONDI's loan contract spend <amount> WETH, which the
+                                        listings' loanOffer lends (sends a transaction)
   market-maker opensea-profile <username> [display name]
                                         sign in to opensea.io as the wallet, accepting OpenSea's
                                         terms, claim <username> and set the name its offers show
@@ -42,8 +52,17 @@ const USAGE = `Usage:
                                         wallet that has a username keeps it
   market-maker wrap <amount>            wrap <amount> of the wallet's ETH into WETH (sends a
                                         transaction)
-  market-maker approve-nft <collection> let Seaport (or the collection's Seaport conduit) move its
-                                        items, so they can be listed (sends a transaction)
+  market-maker swap-usdc <amount> [send]
+                                        quote swapping <amount> of the wallet's USDC into WETH on
+                                        Uniswap, and with send swap it (sends up to two
+                                        transactions); refuses a quote over 1% under GONDI's ETH
+                                        price, or gas over 30 gwei
+  market-maker approve-nft <collection> [opensea]
+                                        let Seaport (or the collection's Seaport conduit) move its
+                                        items, so they can be listed, or with opensea, OpenSea's
+                                        conduit, so bidExit can sell them into OpenSea offers
+                                        and openSeaListing can list them there
+                                        (sends a transaction)
   market-maker record-prices <tasks.json> <history.json> [days]
                                         record the last [days] (default 7) of the file's
                                         collections' floor and best bid, every 15 minutes, from
@@ -76,7 +95,8 @@ Environment:
   MARKET_MAKER_METRICS_URL       where each round's metrics are POSTed as Prometheus text, such as
                                  VictoriaMetrics' /api/v1/import/prometheus (optional)
   OPENSEA_API_KEY                an OpenSea API key, which tasks with "venue": "opensea" bid
-                                 with (optional)`;
+                                 with, bidExit sells into OpenSea offers with and
+                                 openSeaListing lists held items with (optional)`;
 
 const createGondi = async () =>
   gondiFor(
@@ -101,6 +121,11 @@ const runnerFor = async (tasksPath: string) => {
   );
   runner.on('loss', (report) => console.log(`${new Date().toISOString()} ${describeLoss(report)}`));
   runner.on('wrap', (report) => console.log(`${new Date().toISOString()} ${describeWrap(report)}`));
+  runner.on('exit', (report) => console.log(`${new Date().toISOString()} ${describeExit(report)}`));
+  runner.on('mirror', (report) =>
+    console.log(`${new Date().toISOString()} ${describeMirror(report)}`),
+  );
+  runner.on('lend', (report) => console.log(`${new Date().toISOString()} ${describeLend(report)}`));
   return runner;
 };
 
@@ -121,11 +146,40 @@ const approveVenue = async (amount: string, venue: Venue) => {
   );
 };
 
+const approveLoans = async (amount: string) => {
+  const wei = parsePositiveEther(amount);
+  const gondi = await createGondi();
+  const approval = await gondi.approveToken({
+    tokenAddress: WETH,
+    amount: wei,
+    to: MULTI_SOURCE_LOAN,
+  });
+  await approval.waitTxInBlock();
+  console.log(`GONDI's loan contract may now spend ${amount} WETH from ${gondi.account.address}`);
+};
+
 const wrap = async (amount: string) => {
   const wei = parsePositiveEther(amount);
   const market = new GondiMarket(await createGondi());
   await market.wrapEth(wei);
   console.log(`wrapped ${amount} ETH into WETH in ${market.account}`);
+};
+
+const USDC_AMOUNT = /^\d+(\.\d{1,6})?$/;
+
+const swapUsdc = async (amount: string, send: string | undefined) => {
+  if (send !== undefined && send !== 'send') throw new Error('expected send or nothing');
+  if (!USDC_AMOUNT.test(amount) || Number(amount) <= 0) {
+    throw new Error(`expected a USDC amount such as "4000", got ${amount}`);
+  }
+  await swapUsdcForWeth(await createGondi(), {
+    usdc: parseUnits(amount, USDC_DECIMALS),
+    ethUsd: await new GondiApi().currencyUsdPrice(WETH),
+    maxSlippagePercent: 1,
+    maxGasGwei: 30,
+    send: send === 'send',
+    log: console.log,
+  });
 };
 
 const openSeaProfile = async (username: string, displayName: string | undefined) => {
@@ -139,10 +193,20 @@ const openSeaProfile = async (username: string, displayName: string | undefined)
   );
 };
 
-const approveNft = async (collection: string) => {
+const approveNft = async (collection: string, venue: string | undefined) => {
+  if (venue !== undefined && venue !== 'opensea') throw new Error('expected opensea or nothing');
   const gondi = await createGondi();
-  const approval = await collectionApproval(gondi, new GondiApi(), collection);
+  const approval = await collectionApproval(
+    gondi,
+    new GondiApi(),
+    collection,
+    venue === 'opensea' ? OPENSEA_CONDUIT : undefined,
+  );
   const { operator } = approval;
+  if (approval.approved) {
+    console.log(`${operator} may already move ${collection} items from ${gondi.account.address}`);
+    return;
+  }
   await approveCollection(gondi, approval);
   console.log(`${operator} may now move ${collection} items from ${gondi.account.address}`);
 };
@@ -230,9 +294,11 @@ const main = async () => {
   if (command === 'cancel-all' && argument) return (await runnerFor(argument)).cancelAll();
   if (command === 'approve' && argument) return approveVenue(argument, 'gondi');
   if (command === 'approve-opensea' && argument) return approveVenue(argument, 'opensea');
+  if (command === 'approve-loans' && argument) return approveLoans(argument);
   if (command === 'opensea-profile' && argument) return openSeaProfile(argument, rest[0]);
   if (command === 'wrap' && argument) return wrap(argument);
-  if (command === 'approve-nft' && argument) return approveNft(argument);
+  if (command === 'swap-usdc' && argument) return swapUsdc(argument, rest[0]);
+  if (command === 'approve-nft' && argument) return approveNft(argument, rest[0]);
   if (command === 'record-prices' && argument && rest[0])
     return recordPrices(argument, rest[0], rest[1]);
   if (command === 'backtest' && argument && rest[0]) return backtest(argument, rest[0], rest[1]);

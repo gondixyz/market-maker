@@ -1,4 +1,4 @@
-import type { Gondi } from 'gondi';
+import { type Gondi, OffersSortField, OfferStatus, Ordering } from 'gondi';
 import {
   type Address,
   getAddress,
@@ -12,19 +12,26 @@ import {
 import type {
   BidScope,
   BidSnapshot,
+  ExitOffer,
+  ExitSale,
   Fill,
   ItemListing,
   ListingMarket,
   ListingScope,
+  LoanBook,
+  LoanVenue,
   Market,
   OwnBid,
   OwnListing,
+  OwnLoanOffer,
   SaleTerms,
+  Trait,
 } from '../engine/market';
 import {
   type ApiOrder,
   type CollectionMarket,
   GondiApi,
+  type HeldNft,
   type OrdersFilter,
   type OrderStatus,
   type PriceApi,
@@ -37,6 +44,21 @@ export const WETH: Address = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
  * pay with and to move the items listings sell.
  */
 export const SEAPORT: Address = '0x0000000000000068F116a894984e2DB1123eB395';
+
+/**
+ * GONDI's MultiSourceLoan v3.1 on Ethereum, the contract the bot signs its loan offers for: it
+ * pulls a loan's WETH from the lender, so the wallet allows it to spend WETH.
+ */
+export const MULTI_SOURCE_LOAN: Address = '0xf41B389E0C1950dc0B16C9498eaE77131CC08A56';
+
+/** The statuses of a loan offer whose signature can still lend, whatever the API ranks it. */
+const OPEN_LOAN_OFFER_STATUSES = [
+  OfferStatus.Active,
+  OfferStatus.Inactive,
+  OfferStatus.Outperformed,
+];
+/** How many of its own open loan offers on a collection one page lists, newest first. */
+const OWN_LOAN_OFFERS_PAGE = 100;
 
 const NATIVE_MARKETPLACE = 'MarketPlace.Native';
 const ACTIVE_STATUS = 'OrderStatus.Active';
@@ -68,6 +90,8 @@ type ClosedBidsRead = {
 };
 
 const BPS = 10_000n;
+/** How far over the estimate and the gas price a sale's gas limit and fee cap reach. */
+const GAS_HEADROOM_PERCENT = 120n;
 
 /** Seaport's ConduitController on Ethereum, which deploys and names every Seaport conduit. */
 const CONDUIT_CONTROLLER: Address = '0x00000000F9490004C11Cef243f5400493c00Ad63';
@@ -89,6 +113,14 @@ type ListingCollection = {
 };
 
 const itemKey = ({ slug, tokenId }: ListingScope) => `${slug}#${tokenId}`;
+
+/** A loan offer's id for the engine: its contract and its id there, which hiding it needs. */
+const loanOfferId = (contractAddress: Address, offerId: bigint) => `${contractAddress}:${offerId}`;
+
+const parseLoanOfferId = (id: string) => {
+  const [contractAddress, offerId] = id.split(':');
+  return { contractAddress: getAddress(contractAddress), offerId: BigInt(offerId) };
+};
 
 const toOwnListing = (order: ApiOrder): OwnListing => ({
   id: order.id,
@@ -147,6 +179,31 @@ export const bidLevels = (orders: ApiOrder[]) =>
   [...new Set(orders.map((order) => order.steppedPrice ?? order.price))].sort((first, second) =>
     first > second ? -1 : first < second ? 1 : 0,
   );
+
+/** The orders that compete with or belong to a bid on one target: a collection or a trait. */
+type BookFilter = Pick<OrdersFilter, 'collections' | 'traits' | 'orderTypes'>;
+
+/**
+ * What a snapshot of a scope reads, resolved on one GONDI deployment: the filter of its own bids,
+ * the books its competing bids come from, a key naming the target there, and its floor.
+ */
+type ScopeBook = {
+  filter: BookFilter;
+  competing: BookFilter[];
+  key: string;
+  floorPrice: bigint | null;
+  traitId?: number;
+};
+
+const collectionBook = (collectionId: number): BookFilter => ({
+  collections: [collectionId],
+  orderTypes: ['COLLECTION'],
+});
+
+const traitKey = (slug: string, { type, value }: Trait) => `${slug}#${type}#${value}`;
+
+const hasTrait = (item: HeldNft, trait: Trait) =>
+  item.traits.some(({ type, value }) => type === trait.type && value === trait.value);
 
 const erc721Abi = parseAbi(['function balanceOf(address owner) view returns (uint256)']);
 const wethAbi = parseAbi(['function deposit() payable']);
@@ -209,12 +266,13 @@ const closedReadStart = (read: ClosedBidsRead) =>
  * from the API, whose index of owners trails a purchase by up to a minute: a bid that just filled
  * must count at once, or `maxItems` would let the task buy one more.
  */
-export class GondiMarket implements Market {
+export class GondiMarket implements Market, LoanVenue {
   private readonly priceSteps = new Map<number, bigint>();
   private readonly collectionIds = new Map<string, number>();
   private readonly listingCollections = new Map<string, ListingCollection>();
   private readonly nftIds = new Map<string, number>();
-  private readonly closedBidsReads = new Map<number, ClosedBidsRead>();
+  private readonly traitIds = new Map<string, number>();
+  private readonly closedBidsReads = new Map<string, ClosedBidsRead>();
 
   /**
    * `priceApi` is where market prices are read: the floor, the best competing bid, the lowest
@@ -233,6 +291,88 @@ export class GondiMarket implements Market {
     return this.gondi.account.address;
   }
 
+  /** GONDI lends: the market is its own loan venue. */
+  get loans(): LoanVenue {
+    return this;
+  }
+
+  /**
+   * IMPLEMENTATION NOTE: the wallet's own loan offers come from the SDK's `offers`, which lists
+   * through the SDK's signed-in session: `listOffers` filters by `lenders` only for the signed-in
+   * lender, and only that lender sees the offers it hid. The loan contract pulls WETH from the
+   * lender as a loan starts, so the allowance read is the one `MULTI_SOURCE_LOAN` holds.
+   */
+  async loanBook(slug: string): Promise<LoanBook> {
+    const collectionId = await this.collectionId(slug);
+    const [offers, balance, allowance] = await Promise.all([
+      this.ownLoanOffers(collectionId),
+      this.gondi.currencyBalance({ tokenAddress: WETH }),
+      this.gondi.currencyAllowance({ tokenAddress: WETH, to: MULTI_SOURCE_LOAN }),
+    ]);
+    return { offers, balance, allowance };
+  }
+
+  /**
+   * Signs a WETH offer for one loan against one item (capacity zero: the loan contract cancels it
+   * as it lends) for `MULTI_SOURCE_LOAN`, the contract the wallet allows to spend its WETH, and the
+   * one GONDI's buy-now-pay-later takes offers for, and publishes it. Any borrower may take it
+   * (no `borrowerAddress`), as the buyer is not known yet; it asks no senior tranche ahead of it
+   * (`maxSeniorRepayment` zero), lets other lenders refinance it, and needs no liquidation: a
+   * default on a loan the wallet lends alone sends the item back to the wallet.
+   *
+   * IMPLEMENTATION NOTE: the SDK's `_makeSingleNftOffer(offer, mslContractAddress)` is
+   * `makeSingleNftOffer` with the contract named rather than the SDK's default for the chain: it
+   * asks the API for the offer's hash, signs it with the wallet and saves it, returning the saved
+   * offer with its `offerId` and `contractAddress`. The API keeps the origination `fee`, at most
+   * normalizing it to the one whose prorated effective APR matches. A buyer's
+   * `buyNowPayLater` takes offers on the item for the newest loan contract that lets lenders
+   * refinance, v3.1 (https://github.com/gondixyz/gondi-js, `src/gondi.ts`).
+   */
+  async placeLoanOffer({
+    scope,
+    principal,
+    aprBps,
+    durationSeconds,
+    fee,
+    expiration,
+  }: Parameters<LoanVenue['placeLoanOffer']>[0]): Promise<OwnLoanOffer> {
+    const offer = await this.gondi._makeSingleNftOffer(
+      {
+        nftId: await this.nftId(scope),
+        principalAddress: WETH,
+        principalAmount: principal,
+        capacity: 0n,
+        fee,
+        aprBps,
+        duration: durationSeconds,
+        expirationTime: BigInt(Math.floor(expiration.getTime() / 1_000)),
+        requiresLiquidation: false,
+        maxSeniorRepayment: 0n,
+      },
+      MULTI_SOURCE_LOAN,
+    );
+    return {
+      id: loanOfferId(offer.contractAddress, offer.offerId),
+      tokenId: scope.tokenId,
+      principal,
+      aprBps,
+      durationSeconds,
+      expiration,
+      hidden: false,
+    };
+  }
+
+  async hideLoanOffers(offers: OwnLoanOffer[]) {
+    const byContract = new Map<Address, bigint[]>();
+    for (const offer of offers) {
+      const { contractAddress, offerId } = parseLoanOfferId(offer.id);
+      byContract.set(contractAddress, [...(byContract.get(contractAddress) ?? []), offerId]);
+    }
+    for (const [contractAddress, ids] of byContract) {
+      await this.gondi.hideOffers({ ids, contractAddress });
+    }
+  }
+
   async snapshot(scope: BidScope, since: Date): Promise<BidSnapshot> {
     const market = await this.api.collectionMarket({
       slug: scope.slug,
@@ -240,26 +380,27 @@ export class GondiMarket implements Market {
     });
     this.collectionIds.set(scope.slug, market.collectionId);
     const prices = await this.priceMarket(scope.slug, market);
+    const priceBook = await this.scopeBook(this.priceApi, scope, prices);
+    const ownBook =
+      this.priceApi === this.api ? priceBook : await this.scopeBook(this.api, scope, market);
+    if (ownBook.traitId !== undefined && scope.kind === 'trait') {
+      this.traitIds.set(traitKey(scope.slug, scope.trait), ownBook.traitId);
+    }
     const [competingBidLevels, ownBids, priceStep, held, balance, allowance] = await Promise.all([
-      this.competingBidLevels(prices.collectionId, scope.levels ?? 1),
-      this.ownBids(market.collectionId, since),
+      this.competingBidLevels(priceBook.competing, scope.levels ?? 1),
+      this.ownBids(ownBook, since),
       this.priceStep(market.collectionId),
-      this.gondi.bcClient.readContract({
-        address: market.contractAddress,
-        abi: erc721Abi,
-        functionName: 'balanceOf',
-        args: [this.account],
-      }),
+      this.held(scope, market.contractAddress),
       this.gondi.currencyBalance({ tokenAddress: WETH }),
       this.gondi.currencyAllowance({ tokenAddress: WETH, to: SEAPORT }),
     ]);
     return {
-      floorPrice: prices.floorPrice,
+      floorPrice: priceBook.floorPrice,
       bestCompetingBid: competingBidLevels[0] ?? null,
       competingBidLevels,
       ownBids,
       priceStep,
-      held: Number(held),
+      held,
       balance,
       allowance,
     };
@@ -268,10 +409,8 @@ export class GondiMarket implements Market {
   async placeBid({ scope, price, quantity, expiration }: Parameters<Market['placeBid']>[0]) {
     const placedAt = new Date(Math.floor(Date.now() / 1_000) * 1_000);
     const now = BigInt(placedAt.getTime() / 1_000);
-    const collectionId = this.collectionIds.get(scope.slug);
-    if (collectionId === undefined) throw new Error(`no snapshot of ${scope.slug} yet`);
     const order = await this.gondi.makeOrder({
-      collectionId,
+      ...this.bidTarget(scope),
       currencyAddress: WETH,
       price,
       amount: 0n,
@@ -343,7 +482,8 @@ export class GondiMarket implements Market {
   }
 
   async heldItems(slug: string) {
-    return this.api.heldNfts({ slug, owner: this.account });
+    const items = await this.api.heldNfts({ slug, owner: this.account });
+    return items.map((item) => item.tokenId);
   }
 
   async listingMarket(slug: string): Promise<ListingMarket> {
@@ -368,6 +508,102 @@ export class GondiMarket implements Market {
       }),
     ]);
     return { lowestCompetingAsk, bestCompetingBid, approved };
+  }
+
+  /**
+   * The best of the first page of the collection's live WETH collection bids, by price, that another
+   * wallet placed on GONDI's own book, as a seller would take it: its royalties and fees
+   * (`saleTerms`) taken out. Bids indexed from other marketplaces are left out, and so are bids
+   * past their expiration, which the API can still report active. Read from the API the bot trades
+   * on, where `sellToOffer` fills it.
+   */
+  async exitOffer(slug: string): Promise<ExitOffer | null> {
+    const { collectionId } = await this.api.collectionMarket({ slug, currencies: [WETH] });
+    const now = Date.now();
+    const [{ orders }, { feeBps }] = await Promise.all([
+      this.api.orders({
+        side: 'BID',
+        collections: [collectionId],
+        orderTypes: ['COLLECTION'],
+        excludeMakers: [this.account],
+        currencies: [WETH],
+        sortBy: [{ field: 'PRICE', order: 'DESC' }],
+        limit: BOOK_PAGE,
+      }),
+      this.saleTerms(slug),
+    ]);
+    const best = orders
+      .filter((order) => order.marketPlace === NATIVE_MARKETPLACE)
+      .filter((order) => order.expiration.getTime() > now)
+      .reduce<ApiOrder | undefined>(
+        (current, order) => (!current || order.price > current.price ? order : current),
+        undefined,
+      );
+    if (!best) return null;
+    return {
+      id: String(best.id),
+      venue: 'gondi',
+      netPrice: best.price - (best.price * feeBps) / BPS,
+    };
+  }
+
+  async gasPrice() {
+    return this.gondi.bcClient.getGasPrice();
+  }
+
+  /**
+   * Sells the item into the GONDI bid `offer.id` names, only when the bid's net price, less the
+   * most the transaction's gas limit and fee cap can spend, is at least `minProceeds`, and the
+   * wallet has let the collection's operator move its items. Call `listingMarket` for the
+   * collection first, as the round does.
+   *
+   * IMPLEMENTATION NOTE: GONDI's API builds the sale as the SDK's `sellNft` does: the
+   * `getSaleCalldata(orderId, nftId, taker)` query on the signed-in `apiClient` returns the
+   * calldata of a Seaport fill of the bid. `sellNft` sends it with no gas limit or fee cap, so it is
+   * sent here instead, to Seaport (where GONDI orders fill, `SEAPORT`) with no ETH, as a WETH bid
+   * pays; viem's `estimateGas`, `sendTransaction` and `waitForTransactionReceipt`
+   * (https://viem.sh/docs/actions/public/estimateGas) price, send and wait for it.
+   */
+  async sellToOffer({ scope, offer, minProceeds }: ExitSale) {
+    if (offer.venue !== 'gondi') throw new Error(`a ${offer.venue} offer is not GONDI's to fill`);
+    const collection = this.listingCollection(scope.slug);
+    const approved = await this.gondi.isApprovedNFTForAll({
+      nftAddress: collection.contractAddress,
+      standard: 'ERC721',
+      to: collection.operator,
+    });
+    if (!approved) {
+      throw new Error(
+        `${collection.operator} may not move ${scope.slug} items: run market-maker approve-nft ${scope.slug}`,
+      );
+    }
+    const { saleCalldata: data } = await this.gondi.apiClient.getSaleCalldata({
+      orderId: Number(offer.id),
+      nftId: await this.nftId(scope),
+      taker: this.account,
+    });
+    const [estimate, gasPrice] = await Promise.all([
+      this.gondi.bcClient.estimateGas({ account: this.account, to: SEAPORT, data }),
+      this.gondi.bcClient.getGasPrice(),
+    ]);
+    const gas = (estimate * GAS_HEADROOM_PERCENT) / 100n;
+    const maxFeePerGas = (gasPrice * GAS_HEADROOM_PERCENT) / 100n;
+    const proceeds = offer.netPrice - gas * maxFeePerGas;
+    if (proceeds < minProceeds) {
+      throw new Error(
+        `the sale would pay ${proceeds} wei after gas, under the ${minProceeds} wei it needs`,
+      );
+    }
+    const hash = await this.gondi.wallet.sendTransaction({
+      account: this.gondi.account,
+      chain: this.gondi.wallet.chain,
+      to: SEAPORT,
+      data,
+      gas,
+      maxFeePerGas,
+    });
+    const receipt = await this.gondi.bcClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') throw new Error(`selling into the bid reverted in ${hash}`);
   }
 
   async itemListing(scope: ListingScope, since: Date): Promise<ItemListing> {
@@ -444,6 +680,51 @@ export class GondiMarket implements Market {
     return nftId;
   }
 
+  /**
+   * The wallet's single-item WETH loan offers on the collection's items whose signature may still
+   * lend, a single loan each, every page of them; `nftCollateralTokenId` names the item an offer
+   * lends against.
+   */
+  private async ownLoanOffers(collectionId: number): Promise<OwnLoanOffer[]> {
+    const offers: Awaited<ReturnType<Gondi['offers']>>['offers'] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.gondi.offers({
+        limit: OWN_LOAN_OFFERS_PAGE,
+        cursor,
+        sortBy: { field: OffersSortField.CreatedDate, order: Ordering.Desc },
+        filterBy: {
+          lenders: [this.account],
+          collection: collectionId,
+          onlySingleNftOffers: true,
+          status: OPEN_LOAN_OFFER_STATUSES,
+        },
+      });
+      offers.push(...page.offers);
+      cursor = page.hasNextPage ? page.cursor : undefined;
+    } while (cursor !== undefined);
+    return offers
+      .filter((offer) => isAddressEqual(offer.principalAddress, WETH))
+      .map((offer) => ({
+        id: loanOfferId(offer.contractAddress, offer.offerId),
+        tokenId: offer.nftCollateralTokenId,
+        principal: offer.principalAmount,
+        aprBps: offer.aprBps,
+        durationSeconds: offer.duration,
+        expiration: new Date(Number(offer.expirationTime) * 1_000),
+        hidden: offer.hidden ?? false,
+      }));
+  }
+
+  /** The collection's id on `api`, read once a run. */
+  private async collectionId(slug: string) {
+    const cached = this.collectionIds.get(slug);
+    if (cached !== undefined) return cached;
+    const market = await this.api.collectionMarket({ slug, currencies: [zeroAddress, WETH] });
+    this.collectionIds.set(slug, market.collectionId);
+    return market.collectionId;
+  }
+
   /** The collection's market on `priceApi`: `market` itself when prices come from `api`. */
   private async priceMarket(slug: string, market: CollectionMarket) {
     return this.priceApi === this.api
@@ -481,24 +762,109 @@ export class GondiMarket implements Market {
   }
 
   private async bestCompetingBid(collectionId: number) {
-    const [best] = await this.competingBidLevels(collectionId, 1);
+    const [best] = await this.competingBidLevels([collectionBook(collectionId)], 1);
     return best ?? null;
   }
 
   /**
-   * The best `levels` competing price levels of the collection's WETH bids, best first, the
-   * wallet's own excluded: one order for one level, else the book a page at a time until it holds
-   * that many distinct prices, ends, or `MAX_BOOK_PAGES` pages are read. Fewer levels than asked
-   * leave `level` pricing without a price, so a book cut short waits rather than bids too high.
+   * What a snapshot of `scope` reads on `api`, for the collection `market` describes there: the
+   * collection's bids and floor, or the trait's. A trait bid competes with the collection bids as
+   * well as the bids on the trait, since an item with the trait can be sold into either. A trait is
+   * looked up by name each round, which
+   * also reads its floor; ids differ between deployments, so prices and own bids each resolve it
+   * on their own.
    */
-  private async competingBidLevels(collectionId: number, levels: number) {
+  private async scopeBook(
+    api: PriceApi,
+    scope: BidScope,
+    market: { collectionId: number; floorPrice: bigint | null },
+  ): Promise<ScopeBook> {
+    const collection = collectionBook(market.collectionId);
+    if (scope.kind === 'collection') {
+      return {
+        filter: collection,
+        competing: [collection],
+        key: `collection#${market.collectionId}`,
+        floorPrice: market.floorPrice,
+      };
+    }
+    const { traitId, floorPrice } = await api.traitMarket(market.collectionId, scope.trait, [
+      zeroAddress,
+      WETH,
+    ]);
+    const trait: BookFilter = { traits: [traitId], orderTypes: ['TRAIT'] };
+    return {
+      filter: trait,
+      competing: [trait, collection],
+      key: `trait#${traitId}`,
+      floorPrice,
+      traitId,
+    };
+  }
+
+  /** The `makeOrder` fields that say what a bid on `scope` fills with. */
+  private bidTarget(scope: BidScope) {
+    if (scope.kind === 'trait') {
+      const traitId = this.traitIds.get(traitKey(scope.slug, scope.trait));
+      if (traitId === undefined) throw new Error(`no snapshot of ${scope.slug} yet`);
+      return { traitIds: [traitId] };
+    }
+    const collectionId = this.collectionIds.get(scope.slug);
+    if (collectionId === undefined) throw new Error(`no snapshot of ${scope.slug} yet`);
+    return { collectionId };
+  }
+
+  /**
+   * How many items the bid on `scope` can fill with the wallet holds: of the collection on-chain,
+   * at once after a fill. With a trait, the items the API's owners index shows with it, plus every
+   * item the wallet holds on-chain that the index, trailing a fill by up to a minute, does not show
+   * yet: one of those may be the fill, so it counts as having the trait until the index says.
+   */
+  private async held(scope: BidScope, contractAddress: Address) {
+    if (scope.kind === 'collection') return this.balanceOf(contractAddress);
+    const { slug, trait } = scope;
+    const [items, balance] = await Promise.all([
+      this.api.heldNfts({ slug, owner: this.account }),
+      this.balanceOf(contractAddress),
+    ]);
+    const withTrait = items.filter((item) => hasTrait(item, trait)).length;
+    return withTrait + Math.max(0, balance - items.length);
+  }
+
+  /** How many of the collection's items the wallet holds, read on-chain. */
+  private async balanceOf(contractAddress: Address) {
+    const balance = await this.gondi.bcClient.readContract({
+      address: contractAddress,
+      abi: erc721Abi,
+      functionName: 'balanceOf',
+      args: [this.account],
+    });
+    return Number(balance);
+  }
+
+  /**
+   * The best `levels` competing price levels of the WETH bids `books` select together, best first,
+   * the wallet's own excluded. The best `levels` of their union are among the best `levels` of each
+   * book, so each is read on its own (`bookOrders`) and the reads merged.
+   */
+  private async competingBidLevels(books: BookFilter[], levels: number) {
+    const reads = await Promise.all(books.map((book) => this.bookOrders(book, levels)));
+    return bidLevels(reads.flat()).slice(0, levels);
+  }
+
+  /**
+   * The WETH bids of `book` that hold its best `levels` price levels, best first, the wallet's own
+   * excluded: one order for one level, else the book a page at a time until it holds that many
+   * distinct prices, ends, or `MAX_BOOK_PAGES` pages are read. Fewer levels than asked leave
+   * `level` pricing without a price, so a book cut short waits rather than bids too high.
+   */
+  private async bookOrders(book: BookFilter, levels: number) {
     const orders: ApiOrder[] = [];
     let after: string | undefined;
     for (let page = 0; page < MAX_BOOK_PAGES; page += 1) {
       const read = await this.priceApi.orders({
         side: 'BID',
-        collections: [collectionId],
-        orderTypes: ['COLLECTION'],
+        ...book,
         excludeMakers: [this.account],
         currencies: [WETH],
         sortBy: [{ field: 'PRICE', order: 'DESC' }],
@@ -509,29 +875,33 @@ export class GondiMarket implements Market {
       if (!read.nextCursor || bidLevels(orders).length >= levels) break;
       after = read.nextCursor;
     }
-    return bidLevels(orders).slice(0, levels);
+    return orders;
   }
 
   /**
-   * The wallet's GONDI bids on the collection: every active one, whenever it was placed, and every
-   * closed one placed since `since` that bought something. A bid the runner replaced is cancelled,
-   * not executed, yet its fills still count against the task's `quantity`.
+   * The wallet's GONDI bids on the book's target (its collection bids, or its bids on the trait):
+   * every active one, whenever it was placed, and every closed one placed since `since` that bought
+   * something. A bid the runner replaced is cancelled, not executed, yet its fills still count
+   * against the task's `quantity`. Only WETH bids are read, the one currency `placeBid` bids in: with
+   * the marketplace, that lets the API read them from the wallet's own orders alone rather than
+   * from every order ever made on the collection.
    *
-   * The closed bids are read in full once per run and collection, then only back to the oldest bid
+   * The closed bids are read in full once per run and target, then only back to the oldest bid
    * that can have closed since the previous read (`closedBidsRead`), so a long run does not page
    * through every bid it ever replaced on each round. Nothing is persisted: a restart reads them in
    * full again.
    */
-  private async ownBids(collectionId: number, since: Date) {
+  private async ownBids(book: ScopeBook, since: Date) {
     const filter = {
       side: 'BID',
-      collections: [collectionId],
-      orderTypes: ['COLLECTION'],
+      ...book.filter,
       makers: [this.account],
+      marketplaces: ['NATIVE'],
+      currencies: [WETH],
       sortBy: [{ field: 'CREATED_DATE', order: 'DESC' }],
       limit: OWN_ORDERS_PAGE,
     } satisfies OrdersFilter;
-    const previous = this.closedBidsReads.get(collectionId);
+    const previous = this.closedBidsReads.get(book.key);
     const read = previous?.since.getTime() === since.getTime() ? previous : undefined;
     const readAt = new Date();
     const [{ orders: active }, closed] = await Promise.all([
@@ -547,10 +917,8 @@ export class GondiMarket implements Market {
       unsettled.delete(order.id);
       if (order.executions > 0) filled.set(order.id, order);
     }
-    this.closedBidsReads.set(collectionId, { since, readAt, filled, unsettled });
-    return [...active, ...filled.values()]
-      .filter((order) => order.marketPlace === NATIVE_MARKETPLACE)
-      .map(toOwnBid);
+    this.closedBidsReads.set(book.key, { since, readAt, filled, unsettled });
+    return [...active, ...filled.values()].map(toOwnBid);
   }
 
   /** Every closed bid matching `filter` placed since `since`, page by page, newest first. */

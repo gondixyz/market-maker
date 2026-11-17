@@ -1,16 +1,42 @@
 import type { Gondi } from 'gondi';
-import { type Address, type Hash, isAddressEqual, parseAbi, zeroAddress } from 'viem';
+import {
+  type Address,
+  concat,
+  encodeFunctionData,
+  type Hash,
+  hashStruct,
+  isAddressEqual,
+  parseAbi,
+  zeroAddress,
+  zeroHash,
+} from 'viem';
 import { mainnet } from 'viem/chains';
 
-import type { BidScope, BidSnapshot, BidVenue, OwnBid } from '../engine/market';
+import { percentOf } from '../engine/basisPoints';
+import { withGasHeadroom } from '../engine/gas';
+import type {
+  BidScope,
+  BidSnapshot,
+  BidVenue,
+  ExitOffer,
+  ExitSale,
+  ExitVenue,
+  ListingScope,
+  MirrorListing,
+  MirrorVenue,
+  OwnBid,
+} from '../engine/market';
 import type { GondiApi } from '../gondi/api';
 import { WETH } from '../gondi/market';
 import {
+  type OfferFulfillment,
   type OpenSeaApi,
   type OpenSeaCollection,
   type OpenSeaConsiderationItem,
+  type OpenSeaListing,
   type OpenSeaOffer,
   SEAPORT_PROTOCOL,
+  type SignedOrder,
 } from './api';
 
 /** The conduit OpenSea's orders name, and the contract a wallet lets spend the WETH they pay. */
@@ -39,12 +65,36 @@ const OPENSEA_SIGNED_ZONE: Address = '0x000056f7000000ece9003ca63978907a00ffd100
  */
 export const OPENSEA_PRICE_STEP = 10n ** 16n;
 
+/**
+ * The grid the bot prices OpenSea listings on, 0.0001 ETH. OpenSea documents no step for
+ * listings; four decimals is the finest its listing form shows, and a mirror rounds up onto it.
+ */
+export const OPENSEA_LISTING_PRICE_STEP = 10n ** 14n;
+
+const NATIVE_ITEM = 0;
 const ERC20_ITEM = 1;
+const ERC721_ITEM = 2;
+/** Whether a Seaport item is WETH, paid as an ERC-20. */
+const isWeth = (item: { itemType: number; token: Address }) =>
+  item.itemType === ERC20_ITEM && isAddressEqual(item.token, WETH);
+/** An ERC-721 item named by a criteria root, which a collection offer asks for. */
+const ERC721_WITH_CRITERIA_ITEM = 4;
+/** Seaport's `Side.CONSIDERATION`: a criteria resolver that names a consideration item. */
+const CONSIDERATION_SIDE = 1;
 const PARTIAL_RESTRICTED = 3;
-const BPS = 10_000n;
 
 const seaportAbi = parseAbi(['function getCounter(address offerer) view returns (uint256)']);
 const erc721Abi = parseAbi(['function balanceOf(address owner) view returns (uint256)']);
+
+/** Seaport 1.6's `fulfillAdvancedOrder` (https://github.com/ProjectOpenSea/seaport-types). */
+const fulfillAdvancedOrderAbi = parseAbi([
+  'struct OfferItem { uint8 itemType; address token; uint256 identifierOrCriteria; uint256 startAmount; uint256 endAmount; }',
+  'struct ConsiderationItem { uint8 itemType; address token; uint256 identifierOrCriteria; uint256 startAmount; uint256 endAmount; address recipient; }',
+  'struct OrderParameters { address offerer; address zone; OfferItem[] offer; ConsiderationItem[] consideration; uint8 orderType; uint256 startTime; uint256 endTime; bytes32 zoneHash; uint256 salt; bytes32 conduitKey; uint256 totalOriginalConsiderationItems; }',
+  'struct AdvancedOrder { OrderParameters parameters; uint120 numerator; uint120 denominator; bytes signature; bytes extraData; }',
+  'struct CriteriaResolver { uint256 orderIndex; uint8 side; uint256 index; uint256 identifier; bytes32[] criteriaProof; }',
+  'function fulfillAdvancedOrder(AdvancedOrder advancedOrder, CriteriaResolver[] criteriaResolvers, bytes32 fulfillerConduitKey, address recipient) payable returns (bool fulfilled)',
+]);
 
 const SEAPORT_DOMAIN = {
   name: 'Seaport',
@@ -84,6 +134,19 @@ const ORDER_TYPES = {
   ],
 } as const;
 
+/** A Seaport order as EIP-712 signs and hashes it: every identifier a `uint256`. */
+const orderComponents = (parameters: SignedOrder['parameters']) => ({
+  ...parameters,
+  offer: parameters.offer.map((item) => ({
+    ...item,
+    identifierOrCriteria: BigInt(item.identifierOrCriteria),
+  })),
+  consideration: parameters.consideration.map((item) => ({
+    ...item,
+    identifierOrCriteria: BigInt(item.identifierOrCriteria),
+  })),
+});
+
 const ORDER_HASH_TYPES = { OrderHash: [{ name: 'orderHash', type: 'bytes32' }] } as const;
 
 /** How many items the offer may buy in all: the amount of its first consideration item, the NFT. */
@@ -93,6 +156,106 @@ const quantityOf = (offer: OpenSeaOffer) =>
 /** What the offer pays per item: its WETH amount over the items it may buy. */
 const pricePerItem = (offer: OpenSeaOffer) =>
   offer.protocol_data.parameters.offer[0].startAmount / quantityOf(offer);
+
+/** The WETH an order's consideration pays others than the offerer: its royalties and fees. */
+const feesOf = (consideration: { itemType: number; token: Address; startAmount: bigint }[]) =>
+  consideration.filter(isWeth).reduce((total, item) => total + item.startAmount, 0n);
+
+/** What selling one item into the offer pays the seller: its price per item, fees taken out. */
+const netPerItem = (offer: OpenSeaOffer) => {
+  const { parameters } = offer.protocol_data;
+  return (parameters.offer[0].startAmount - feesOf(parameters.consideration)) / quantityOf(offer);
+};
+
+/**
+ * The best collection offer on the page that anyone but `account` makes in WETH, can still buy an
+ * item and has not expired, by what it pays the seller; `null` when none.
+ */
+export const bestExitOffer = (
+  offers: OpenSeaOffer[],
+  account: Address,
+  now: Date,
+): ExitOffer | null => {
+  const takeable = offers.filter(({ protocol_data: { parameters }, ...offer }) => {
+    const [paid] = parameters.offer;
+    return (
+      offer.status === 'ACTIVE' &&
+      offer.remaining_quantity > 0 &&
+      parameters.endTime * 1_000 > now.getTime() &&
+      !isAddressEqual(parameters.offerer, account) &&
+      parameters.offer.length === 1 &&
+      isWeth(paid)
+    );
+  });
+  const best = takeable.reduce<OpenSeaOffer | undefined>(
+    (current, offer) => (!current || netPerItem(offer) > netPerItem(current) ? offer : current),
+    undefined,
+  );
+  return best ? { id: best.order_hash, venue: 'opensea', netPrice: netPerItem(best) } : null;
+};
+
+/**
+ * What the fulfillment OpenSea built pays `account` for `tokenId` of `contract`, its royalties and
+ * fees taken out, after checking it is the sale asked for: a call to Seaport with no ETH, paid to
+ * the wallet, of one ERC-721 item of the collection, named by the one resolver of the order's
+ * first consideration item, for WETH from someone else, asking nothing more than WETH fees, at
+ * fixed amounts. Throws on anything else, so nothing OpenSea answers is signed unread.
+ */
+export const fulfillmentProceeds = (
+  fulfillment: OfferFulfillment,
+  { account, contract, tokenId }: { account: Address; contract: Address; tokenId: bigint },
+) => {
+  const { advancedOrder, criteriaResolvers, recipient } = fulfillment.input;
+  const { parameters, numerator, denominator } = advancedOrder;
+  const [paid] = parameters.offer;
+  const [asked, ...fees] = parameters.consideration;
+  const [resolver] = criteriaResolvers;
+  const problems = [
+    !isAddressEqual(fulfillment.to, SEAPORT_PROTOCOL) && `it calls ${fulfillment.to}, not Seaport`,
+    fulfillment.value !== 0n && 'it sends ETH',
+    !isAddressEqual(recipient, zeroAddress) &&
+      !isAddressEqual(recipient, account) &&
+      `it pays ${recipient}`,
+    isAddressEqual(parameters.offerer, account) && 'the offer is the wallet’s own',
+    (parameters.offer.length !== 1 || !isWeth(paid)) && 'the offer does not pay in WETH alone',
+    (asked?.itemType !== ERC721_WITH_CRITERIA_ITEM ||
+      !isAddressEqual(asked.token, contract) ||
+      !isAddressEqual(asked.recipient, parameters.offerer)) &&
+      'the offer does not ask for an item of the collection',
+    !fees.every(isWeth) && 'the offer asks for more than the item and WETH fees',
+    [...parameters.offer, ...parameters.consideration].some(
+      (item) => item.startAmount !== item.endAmount,
+    ) && 'the offer’s amounts change over time',
+    (criteriaResolvers.length !== 1 ||
+      resolver.orderIndex !== 0n ||
+      resolver.side !== CONSIDERATION_SIDE ||
+      resolver.index !== 0n ||
+      resolver.identifier !== tokenId) &&
+      `the sale does not name item ${tokenId}`,
+    (denominator === 0n || numerator * (asked?.startAmount ?? 0n) !== denominator) &&
+      'the sale is not of one item',
+  ].filter((problem) => typeof problem === 'string');
+  if (problems.length > 0) throw new Error(`refused OpenSea's sale: ${problems.join('; ')}`);
+  return ((paid.startAmount - feesOf(fees)) * numerator) / denominator;
+};
+
+/** Seaport's `fulfillAdvancedOrder` call for `fulfillment`, with OpenSea's suffix appended. */
+const fulfillmentCalldata = (fulfillment: OfferFulfillment) => {
+  const { advancedOrder, criteriaResolvers, fulfillerConduitKey, recipient } = fulfillment.input;
+  const data = encodeFunctionData({
+    abi: fulfillAdvancedOrderAbi,
+    functionName: 'fulfillAdvancedOrder',
+    args: [advancedOrder, criteriaResolvers, fulfillerConduitKey, recipient],
+  });
+  return fulfillment.calldataSuffix ? concat([data, fulfillment.calldataSuffix]) : data;
+};
+
+/** The contract a fulfiller's conduit key lets move its item: Seaport itself, or OpenSea's conduit. */
+const fulfillerOperator = (conduitKey: Hash) => {
+  if (conduitKey === zeroHash) return SEAPORT_PROTOCOL;
+  if (conduitKey.toLowerCase() === OPENSEA_CONDUIT_KEY.toLowerCase()) return OPENSEA_CONDUIT;
+  throw new Error(`OpenSea would move the item through the unknown conduit key ${conduitKey}`);
+};
 
 /** When OpenSea first takes an off-chain cancel of an offer that started at `placedAt`. */
 const cancellableFrom = (placedAt: Date) =>
@@ -116,6 +279,30 @@ const toOwnBid = (offer: OpenSeaOffer): OwnBid => {
   };
 };
 
+/**
+ * A listing of the wallet's own as a mirror, with its order hash as its id; `null` for one that is
+ * not of one ERC-721 item of `contract` for ETH alone, or that OpenSea cannot cancel off-chain,
+ * which the bot leaves alone. Its price is what a buyer pays: every consideration item's ETH.
+ */
+const toMirrorListing = (listing: OpenSeaListing, contract: Address): MirrorListing | null => {
+  const { offer, consideration, zone, startTime, endTime } = listing.protocol_data.parameters;
+  const [item] = offer;
+  const isMirror =
+    offer.length === 1 &&
+    item.itemType === ERC721_ITEM &&
+    isAddressEqual(item.token, contract) &&
+    consideration.every((entry) => entry.itemType === NATIVE_ITEM) &&
+    isAddressEqual(zone, OPENSEA_SIGNED_ZONE);
+  if (!isMirror) return null;
+  return {
+    id: listing.order_hash,
+    tokenId: BigInt(item.identifierOrCriteria),
+    price: consideration.reduce((total, entry) => total + entry.startAmount, 0n),
+    expiration: new Date(endTime * 1_000),
+    cancellableFrom: cancellableFrom(new Date(startTime * 1_000)),
+  };
+};
+
 /** Each price anyone but `account` offers per item, once, best first. */
 export const competingBidLevels = (offers: OpenSeaOffer[], account: Address) =>
   [
@@ -127,22 +314,23 @@ export const competingBidLevels = (offers: OpenSeaOffer[], account: Address) =>
   ].sort((first, second) => (first > second ? -1 : first < second ? 1 : 0));
 
 /**
- * The fees an offer of `quantity` items at `price` each must pay, as WETH consideration items:
- * each of the collection's required fees, floored per item so the order splits evenly when it
- * fills partly.
+ * The fees an order of `quantity` items at `price` each must pay, as consideration items in WETH
+ * (an offer) or ETH (a listing): each of the collection's required fees, floored per item so the
+ * order splits evenly when it fills partly.
  */
 export const requiredFees = (
   collection: OpenSeaCollection,
   price: bigint,
   quantity: number,
+  currency: 'weth' | 'eth' = 'weth',
 ): OpenSeaConsiderationItem[] =>
   collection.fees
     .filter((fee) => fee.required)
     .map((fee) => {
-      const total = ((price * BigInt(Math.round(fee.fee * 100))) / BPS) * BigInt(quantity);
+      const total = percentOf(price, fee.fee) * BigInt(quantity);
       return {
-        itemType: ERC20_ITEM,
-        token: WETH,
+        itemType: currency === 'weth' ? ERC20_ITEM : NATIVE_ITEM,
+        token: currency === 'weth' ? WETH : zeroAddress,
         identifierOrCriteria: '0',
         startAmount: total,
         endAmount: total,
@@ -153,6 +341,44 @@ export const requiredFees = (
 /** A random Seaport salt, so two offers with the same terms still hash apart. */
 const randomSalt = () =>
   BigInt(`0x${Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('hex')}`);
+
+/**
+ * The orders a run posted that OpenSea may not list yet, by collection slug: OpenSea lists a new
+ * order only some seconds after accepting it, so each counts among the wallet's own until a read
+ * shows it, it is cancelled, or `LISTING_DELAY_MS` passes.
+ */
+class UnlistedOrders<Order extends { id: string; placedAt: Date }> {
+  private readonly bySlug = new Map<string, Order[]>();
+
+  /** Tracks `order`, just posted on `slug`. */
+  add(slug: string, order: Order) {
+    this.bySlug.set(slug, [...(this.bySlug.get(slug) ?? []), order]);
+  }
+
+  /** Stops tracking the order `id`, whichever slug it was posted on. */
+  forget(id: string) {
+    for (const [slug, orders] of this.bySlug) {
+      this.bySlug.set(
+        slug,
+        orders.filter((order) => order.id !== id),
+      );
+    }
+  }
+
+  /**
+   * The orders posted on `slug` that `listed` does not show yet and that OpenSea has not had
+   * `LISTING_DELAY_MS` to list by `now`; the rest are forgotten.
+   */
+  stillUnlisted(slug: string, listed: { id: string }[], now: Date) {
+    const remaining = (this.bySlug.get(slug) ?? []).filter(
+      (order) =>
+        now.getTime() - order.placedAt.getTime() < LISTING_DELAY_MS &&
+        !listed.some((listedOrder) => listedOrder.id === order.id),
+    );
+    this.bySlug.set(slug, remaining);
+    return remaining;
+  }
+}
 
 /**
  * The engine's bid venue on OpenSea: WETH collection offers posted with the operator's own
@@ -181,10 +407,14 @@ const randomSalt = () =>
  * order created moments before ("Orders created recently must be cancelled onchain"), so each
  * offer carries `cancellableFrom`, and `reconcile` leaves it up until then rather than cancel it.
  */
-export class OpenSeaMarket implements BidVenue {
+export class OpenSeaMarket implements BidVenue, ExitVenue, MirrorVenue {
+  readonly priceStep = OPENSEA_LISTING_PRICE_STEP;
   private readonly collections = new Map<string, OpenSeaCollection>();
-  /** The offers this run posted that OpenSea may not list yet, by collection slug. */
-  private readonly unlisted = new Map<string, OwnBid[]>();
+  private readonly contracts = new Map<string, Address>();
+  /** The offers this run posted that OpenSea may not list yet. */
+  private readonly unlistedOffers = new UnlistedOrders<OwnBid>();
+  /** The listings this run posted that OpenSea may not list yet. */
+  private readonly unlistedMirrors = new UnlistedOrders<MirrorListing & { placedAt: Date }>();
 
   constructor(
     private readonly gondi: Gondi,
@@ -223,7 +453,7 @@ export class OpenSeaMarket implements BidVenue {
       bestCompetingBid: levels[0] ?? null,
       competingBidLevels: levels,
       priceStep: OPENSEA_PRICE_STEP,
-      ownBids: [...listed, ...this.stillUnlisted(scope.slug, listed)],
+      ownBids: [...listed, ...this.unlistedOffers.stillUnlisted(scope.slug, listed, this.now())],
       held: Number(held),
       balance,
       allowance,
@@ -234,12 +464,7 @@ export class OpenSeaMarket implements BidVenue {
     const [collection, built, counter] = await Promise.all([
       this.collection(scope.slug),
       this.openSea.buildOffer({ slug: scope.slug, offerer: this.account, quantity }),
-      this.gondi.bcClient.readContract({
-        address: SEAPORT_PROTOCOL,
-        abi: seaportAbi,
-        functionName: 'getCounter',
-        args: [this.account],
-      }),
+      this.seaportCounter(),
     ]);
     const total = price * BigInt(quantity);
     const startTime = Math.floor(this.now().getTime() / 1_000);
@@ -264,23 +489,7 @@ export class OpenSeaMarket implements BidVenue {
       conduitKey: OPENSEA_CONDUIT_KEY,
       counter,
     };
-    const signature = await this.gondi.wallet.signTypedData({
-      account: this.gondi.account,
-      domain: SEAPORT_DOMAIN,
-      types: ORDER_TYPES,
-      primaryType: 'OrderComponents',
-      message: {
-        ...parameters,
-        offer: parameters.offer.map((item) => ({
-          ...item,
-          identifierOrCriteria: BigInt(item.identifierOrCriteria),
-        })),
-        consideration: parameters.consideration.map((item) => ({
-          ...item,
-          identifierOrCriteria: BigInt(item.identifierOrCriteria),
-        })),
-      },
-    });
+    const signature = await this.signOrder(parameters);
     const orderHash = await this.openSea.postOffer(scope.slug, { parameters, signature });
     const placedAt = new Date(startTime * 1_000);
     const placed: OwnBid = {
@@ -295,7 +504,7 @@ export class OpenSeaMarket implements BidVenue {
       cancelsOffChain: isAddressEqual(built.zone, OPENSEA_SIGNED_ZONE),
       cancellableFrom: cancellableFrom(placedAt),
     };
-    this.unlisted.set(scope.slug, [...(this.unlisted.get(scope.slug) ?? []), placed]);
+    this.unlistedOffers.add(scope.slug, placed);
     return placed;
   }
 
@@ -306,49 +515,262 @@ export class OpenSeaMarket implements BidVenue {
         `offers ${onChainOnly.map((bid) => bid.id).join(', ')} can only be cancelled on-chain`,
       );
     }
-    for (const bid of bids) {
-      const orderHash = bid.id as Hash;
-      const signature = await this.gondi.wallet.signTypedData({
-        account: this.gondi.account,
-        domain: SEAPORT_DOMAIN,
-        types: ORDER_HASH_TYPES,
-        primaryType: 'OrderHash',
-        message: { orderHash },
-      });
-      await this.openSea.cancelOffer(orderHash, signature);
-      for (const [slug, offers] of this.unlisted) {
-        this.unlisted.set(
-          slug,
-          offers.filter((offer) => offer.id !== bid.id),
-        );
-      }
-    }
+    await this.cancelOrders(
+      bids.map((bid) => bid.id),
+      this.unlistedOffers,
+    );
+  }
+
+  async exitOffer(slug: string) {
+    return bestExitOffer(await this.openSea.collectionOffers(slug), this.account, this.now());
+  }
+
+  async gasPrice() {
+    return this.gondi.bcClient.getGasPrice();
   }
 
   /**
-   * The offers this run posted on `slug` that `listed` does not show yet and that OpenSea has not
-   * had `LISTING_DELAY_MS` to list; the rest are forgotten.
+   * Builds the sale with OpenSea, checks it (`fulfillmentProceeds`), and sends it only when what it
+   * pays, less the most its gas limit and fee cap can spend, is at least `minProceeds`, and the
+   * wallet has let the operator its conduit key names move the collection's items.
+   *
+   * IMPLEMENTATION NOTE: the call is encoded from OpenSea's decoded `input_data` with Seaport's
+   * ABI, then OpenSea's `calldata_suffix` is appended, as `fulfillOrder` in opensea-js's
+   * `src/sdk/fulfillment.ts` does (https://github.com/ProjectOpenSea/opensea-js). The fulfiller's
+   * item moves through the conduit `fulfillerConduitKey` names, or Seaport itself for the zero
+   * key (https://github.com/ProjectOpenSea/seaport/blob/main/docs/SeaportDocumentation.md), so
+   * that is the operator the wallet must have approved. viem's `estimateGas`, `sendTransaction`
+   * and `waitForTransactionReceipt` (https://viem.sh/docs/actions/public/estimateGas) price, send
+   * and wait for it.
    */
-  private stillUnlisted(slug: string, listed: OwnBid[]) {
-    const now = this.now().getTime();
-    const remaining = (this.unlisted.get(slug) ?? []).filter(
-      (offer) =>
-        now - offer.placedAt.getTime() < LISTING_DELAY_MS &&
-        !listed.some((listedOffer) => listedOffer.id === offer.id),
+  async sellToOffer({ scope, offer, minProceeds }: ExitSale) {
+    const contract = await this.contractOf(scope.slug);
+    const fulfillment = await this.openSea.offerFulfillment({
+      orderHash: offer.id as Hash,
+      fulfiller: this.account,
+      contract,
+      tokenId: scope.tokenId,
+    });
+    const net = fulfillmentProceeds(fulfillment, {
+      account: this.account,
+      contract,
+      tokenId: scope.tokenId,
+    });
+    const operator = fulfillerOperator(fulfillment.input.fulfillerConduitKey);
+    const approved = await this.gondi.isApprovedNFTForAll({
+      nftAddress: contract,
+      standard: 'ERC721',
+      to: operator,
+    });
+    if (!approved) {
+      throw new Error(
+        `${operator} may not move ${scope.slug} items: run market-maker approve-nft ${scope.slug} opensea`,
+      );
+    }
+    const data = fulfillmentCalldata(fulfillment);
+    const [estimate, gasPrice] = await Promise.all([
+      this.gondi.bcClient.estimateGas({ account: this.account, to: fulfillment.to, data }),
+      this.gondi.bcClient.getGasPrice(),
+    ]);
+    const gas = withGasHeadroom(estimate);
+    const maxFeePerGas = withGasHeadroom(gasPrice);
+    const proceeds = net - gas * maxFeePerGas;
+    if (proceeds < minProceeds) {
+      throw new Error(
+        `the sale would pay ${proceeds} wei after gas, under the ${minProceeds} wei it needs`,
+      );
+    }
+    const hash = await this.gondi.wallet.sendTransaction({
+      account: this.gondi.account,
+      chain: this.gondi.wallet.chain,
+      to: fulfillment.to,
+      data,
+      gas,
+      maxFeePerGas,
+    });
+    const receipt = await this.gondi.bcClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') throw new Error(`selling into the offer reverted in ${hash}`);
+  }
+
+  /**
+   * The wallet's OpenSea listings of the collection's items that the bot can mirror with (see
+   * `toMirrorListing`), with the ones this run posted that OpenSea does not show yet.
+   */
+  async mirrorListings(slug: string) {
+    const contract = await this.contractOf(slug);
+    const listed = (await this.openSea.ownListings(slug, this.account))
+      .map((listing) => toMirrorListing(listing, contract))
+      .filter((listing) => listing !== null);
+    return [...listed, ...this.unlistedMirrors.stillUnlisted(slug, listed, this.now())];
+  }
+
+  /**
+   * Lists the item on OpenSea for `price` in ETH, which the buyer pays: the wallet receives it less
+   * the collection's required fees, each paid to its recipient. Throws, listing nothing, while
+   * OpenSea's conduit may not move the collection's items.
+   *
+   * IMPLEMENTATION NOTE: built the way `opensea-js` builds a listing (`createListing` in
+   * `src/sdk/orders.ts`, https://github.com/ProjectOpenSea/opensea-js): the order offers the one
+   * ERC-721 item and asks for ETH (item type 0, the zero address) to the wallet and to each
+   * required fee of `collections/{slug}`, through OpenSea's conduit, restricted to the SignedZone so
+   * it cancels off-chain like an offer, with a zero zone hash and the wallet's Seaport counter.
+   * Seaport moves the item through that conduit, so the wallet must have approved it for the
+   * collection (`approve-nft <slug> opensea`). The order hash is Seaport's: the EIP-712 struct hash
+   * of its `OrderComponents` (`getOrderHash` in https://github.com/ProjectOpenSea/seaport-js,
+   * computed with viem's `hashStruct`, https://viem.sh/docs/utilities/hashTypedData).
+   */
+  async placeMirrorListing({
+    scope,
+    price,
+    expiration,
+  }: {
+    scope: ListingScope;
+    price: bigint;
+    expiration: Date;
+  }) {
+    const contract = await this.contractOf(scope.slug);
+    const [collection, counter, approved] = await Promise.all([
+      this.terms(scope.slug),
+      this.seaportCounter(),
+      this.gondi.isApprovedNFTForAll({
+        nftAddress: contract,
+        standard: 'ERC721',
+        to: OPENSEA_CONDUIT,
+      }),
+    ]);
+    if (!approved) {
+      throw new Error(
+        `OpenSea's conduit may not move ${scope.slug} items: run market-maker approve-nft ${scope.slug} opensea`,
+      );
+    }
+    const fees = requiredFees(collection, price, 1, 'eth');
+    const proceeds = price - fees.reduce((total, fee) => total + fee.startAmount, 0n);
+    const startTime = Math.floor(this.now().getTime() / 1_000);
+    const parameters: SignedOrder['parameters'] = {
+      offerer: this.account,
+      zone: OPENSEA_SIGNED_ZONE,
+      offer: [
+        {
+          itemType: ERC721_ITEM,
+          token: contract,
+          identifierOrCriteria: scope.tokenId.toString(),
+          startAmount: 1n,
+          endAmount: 1n,
+        },
+      ],
+      consideration: [
+        {
+          itemType: NATIVE_ITEM,
+          token: zeroAddress,
+          identifierOrCriteria: '0',
+          startAmount: proceeds,
+          endAmount: proceeds,
+          recipient: this.account,
+        },
+        ...fees,
+      ],
+      orderType: PARTIAL_RESTRICTED,
+      startTime: BigInt(startTime),
+      endTime: BigInt(Math.floor(expiration.getTime() / 1_000)),
+      zoneHash: zeroHash,
+      salt: randomSalt(),
+      conduitKey: OPENSEA_CONDUIT_KEY,
+      counter,
+    };
+    const signature = await this.signOrder(parameters);
+    await this.openSea.postListing({ parameters, signature });
+    const placedAt = new Date(startTime * 1_000);
+    const placed = {
+      id: hashStruct({
+        data: orderComponents(parameters),
+        primaryType: 'OrderComponents',
+        types: ORDER_TYPES,
+      }),
+      tokenId: scope.tokenId,
+      price,
+      expiration,
+      cancellableFrom: cancellableFrom(placedAt),
+    };
+    this.unlistedMirrors.add(scope.slug, { ...placed, placedAt });
+    return placed;
+  }
+
+  /** Cancels each listing off-chain; OpenSea refuses one placed under five minutes before. */
+  async cancelMirrorListings(listings: MirrorListing[]) {
+    await this.cancelOrders(
+      listings.map((listing) => listing.id),
+      this.unlistedMirrors,
     );
-    this.unlisted.set(slug, remaining);
-    return remaining;
+  }
+
+  /** The collection's contract, read once a run. */
+  private async contractOf(slug: string) {
+    const cached = this.contracts.get(slug);
+    if (cached) return cached;
+    const { contractAddress } = await this.gondiApi.collectionMarket({ slug });
+    this.contracts.set(slug, contractAddress);
+    return contractAddress;
+  }
+
+  /** The wallet's Seaport counter, which every order it signs carries. */
+  private async seaportCounter() {
+    return this.gondi.bcClient.readContract({
+      address: SEAPORT_PROTOCOL,
+      abi: seaportAbi,
+      functionName: 'getCounter',
+      args: [this.account],
+    });
   }
 
   /** The collection's OpenSea terms, read once a run: its fees change rarely, and reads are rationed. */
-  private async collection(slug: string) {
+  private async terms(slug: string) {
     const cached = this.collections.get(slug);
     if (cached) return cached;
     const collection = await this.openSea.collection(slug);
+    this.collections.set(slug, collection);
+    return collection;
+  }
+
+  /** The collection's terms, for an offer: throws when OpenSea takes no collection offers on it. */
+  private async collection(slug: string) {
+    const collection = await this.terms(slug);
     if (!collection.collection_offers_enabled) {
       throw new Error(`OpenSea takes no collection offers on ${slug}`);
     }
-    this.collections.set(slug, collection);
     return collection;
+  }
+
+  /** The wallet's signature of `parameters` as Seaport 1.6's EIP-712 `OrderComponents`. */
+  private async signOrder(parameters: SignedOrder['parameters']) {
+    return this.gondi.wallet.signTypedData({
+      account: this.gondi.account,
+      domain: SEAPORT_DOMAIN,
+      types: ORDER_TYPES,
+      primaryType: 'OrderComponents',
+      message: orderComponents(parameters),
+    });
+  }
+
+  /** Cancels each order off-chain, one at a time, and stops tracking it in `tracked`. */
+  private async cancelOrders(
+    ids: string[],
+    tracked: UnlistedOrders<{ id: string; placedAt: Date }>,
+  ) {
+    for (const id of ids) {
+      await this.cancelOrder(id as Hash);
+      tracked.forget(id);
+    }
+  }
+
+  /** Cancels the order `orderHash`, an offer or a listing, off-chain, with the wallet's signature. */
+  private async cancelOrder(orderHash: Hash) {
+    const signature = await this.gondi.wallet.signTypedData({
+      account: this.gondi.account,
+      domain: SEAPORT_DOMAIN,
+      types: ORDER_HASH_TYPES,
+      primaryType: 'OrderHash',
+      message: { orderHash },
+    });
+    await this.openSea.cancelOrder(orderHash, signature);
   }
 }

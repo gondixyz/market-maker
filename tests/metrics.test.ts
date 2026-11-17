@@ -44,7 +44,9 @@ describe('metricsText', () => {
     expect(lines).toContain(
       `market_maker_task_status{${labels},kind="collectionBid",status="bidding",reason=""} 1`,
     );
-    expect(lines).toContain(`market_maker_order_price_eth{${labels},side="bid",token_id=""} 8.01`);
+    expect(lines).toContain(
+      `market_maker_order_price_eth{${labels},side="bid",token_id="",order_id="100"} 8.01`,
+    );
     expect(lines).toContain(`market_maker_bid_commitment_eth{${labels}} 8.01`);
     expect(lines).toContain(`market_maker_held_items{${labels}} 2`);
     expect(lines).toContain(`market_maker_held_value_eth{${labels}} 20`);
@@ -77,6 +79,9 @@ describe('metricsText', () => {
     expect(lines).toContain('market_maker_fills{collection="pudgypenguins",side="buy"} 1');
     expect(lines).toContain(
       'market_maker_fill_volume_eth{collection="pudgypenguins",side="buy"} 10.45',
+    );
+    expect(lines).toContain(
+      'market_maker_fill_price_eth{collection="pudgypenguins",side="buy",token_id="1",filled_at="2030-01-01T00:00:00.000Z"} 10.45',
     );
     expect(lines.some((line) => line.startsWith('market_maker_order_price_eth'))).toBe(false);
   });
@@ -112,7 +117,7 @@ describe('metricsText', () => {
     const lines = linesOf(metricsText(await reportOf([listingTaskJson()])));
 
     expect(lines).toContain(
-      'market_maker_order_price_eth{task="pudgy-3950",collection="pudgypenguins",side="listing",token_id="3950"} 9.99',
+      'market_maker_order_price_eth{task="pudgy-3950",collection="pudgypenguins",side="listing",token_id="3950",order_id="100"} 9.99',
     );
     expect(lines.some((line) => line.startsWith('market_maker_held_items'))).toBe(false);
   });
@@ -121,7 +126,7 @@ describe('metricsText', () => {
     const lines = linesOf(metricsText(await reportOf([bidTask])));
 
     const labels = 'task="pudgy-bid",collection="pudgypenguins"';
-    const order = `${labels},side="bid",token_id=""`;
+    const order = `${labels},side="bid",token_id="",order_id="100"`;
     expect(lines).toContain(`market_maker_best_competing_bid_eth{${labels}} 8`);
     expect(lines).toContain(`market_maker_order_price_eth{${order}} 8.01`);
     expect(lines).toContain(`market_maker_order_remaining{${order}} 1`);
@@ -132,13 +137,25 @@ describe('metricsText', () => {
     ).toBe(true);
   });
 
+  test('reports each offer of a ladder as its own series', async () => {
+    const ladder = { ...bidTask, ladder: { offers: 3, spacing: '0.5' } };
+    const lines = linesOf(metricsText(await reportOf([ladder])));
+
+    const order = 'task="pudgy-bid",collection="pudgypenguins",side="bid",token_id=""';
+    expect(lines.filter((line) => line.startsWith('market_maker_order_price_eth'))).toEqual([
+      `market_maker_order_price_eth{${order},order_id="100"} 8.01`,
+      `market_maker_order_price_eth{${order},order_id="101"} 7.5`,
+      `market_maker_order_price_eth{${order},order_id="102"} 7`,
+    ]);
+  });
+
   test("reports the book beside the wallet's live listing", async () => {
     const lines = linesOf(metricsText(await reportOf([listingTaskJson()])));
 
     const labels = 'task="pudgy-3950",collection="pudgypenguins"';
     expect(lines).toContain(`market_maker_lowest_competing_ask_eth{${labels}} 10`);
     expect(lines).toContain(
-      `market_maker_order_remaining{${labels},side="listing",token_id="3950"} 1`,
+      `market_maker_order_remaining{${labels},side="listing",token_id="3950",order_id="100"} 1`,
     );
   });
 

@@ -18,7 +18,7 @@ describe('parseTasksFile', () => {
   test.each([
     ['a minimum above the maximum', { minPrice: '10' }],
     ['an amount that is not ETH', { maxPrice: '9e18' }],
-    ['an expiration under 15 minutes', { expirationMinutes: 14 }],
+    ['an expiration under 10 minutes', { expirationMinutes: 9 }],
     ['an unknown pricing mode', { pricing: { mode: 'random' } }],
     ['a maxItems of zero', { maxItems: 0 }],
     ['a ladder of more than 10 offers', { ladder: { offers: 11, spacing: '0.01' } }],
@@ -39,6 +39,20 @@ describe('parseTasksFile', () => {
     ['a maxHeldValue that is not ETH', { maxHeldValue: 30 }],
     ['an OpenSea bid without maxItems', { venue: 'opensea' }],
     ['an unknown venue', { venue: 'blur', maxItems: 1 }],
+    ['a trait bid without its trait', { kind: 'traitBid' }],
+    [
+      'a trait bid with an empty value',
+      { kind: 'traitBid', trait: { type: 'Background', value: '' } },
+    ],
+    [
+      'a trait bid on OpenSea',
+      {
+        kind: 'traitBid',
+        trait: { type: 'Background', value: 'Blue' },
+        venue: 'opensea',
+        maxItems: 1,
+      },
+    ],
   ])('rejects %s', (_case, overrides) => {
     expect(() => taskOf(overrides)).toThrow();
   });
@@ -66,6 +80,17 @@ describe('parseTasksFile', () => {
       pricing: { mode: 'level', level: 5 },
     });
     expect(taskOf().venue).toBe('gondi');
+  });
+
+  test('reads a trait bid on GONDI with the trait as named', () => {
+    expect(
+      taskOf({ kind: 'traitBid', trait: { type: 'Background', value: 'Blue' } }),
+    ).toMatchObject({
+      kind: 'traitBid',
+      trait: { type: 'Background', value: 'Blue' },
+      venue: 'gondi',
+      quantity: 1,
+    });
   });
 
   test('rejects an unknown kind', () => {
@@ -116,6 +141,53 @@ describe('parseTasksFile lossLimits', () => {
   });
 });
 
+describe('parseTasksFile wrapEth', () => {
+  test('reads the gas reserve into wei', () => {
+    expect(tasksFileOf([], { wrapEth: { keepEth: '0.05' } }).wrapEth).toEqual({
+      keepEth: eth('0.05'),
+    });
+  });
+
+  test('rejects a gas reserve of zero', () => {
+    expect(() => tasksFileOf([], { wrapEth: { keepEth: '0' } })).toThrow(
+      'keepEth is the ETH kept for gas',
+    );
+  });
+});
+
+describe('parseTasksFile resaleBid', () => {
+  const lossLimits = { dailyUsd: 400, weeklyUsd: 1_200, since: '2030-01-01T00:00:00Z' };
+  const bid = {
+    id: 'pudgy-buy',
+    kind: 'collectionBid',
+    collection: 'pudgypenguins',
+    pricing: { mode: 'outbid' },
+    minPrice: '5',
+    maxPrice: '9',
+    maxItems: 1,
+    resaleBid: {},
+  };
+  const exit = listingTaskJson({ tokenId: undefined, bidExit: {} });
+
+  test('reads the margin, 2% by default, and the resale limit into wei', () => {
+    const file = tasksFileOf([bid, exit], { lossLimits, resaleLimit: '1' });
+    expect(file.resaleLimit).toBe(eth('1'));
+    expect(file.tasks[0]).toMatchObject({ resaleBid: { marginPercent: 2 } });
+  });
+
+  test.each([
+    ['without resaleLimit', [bid, exit], {}, 'resaleBid needs resaleLimit'],
+    [
+      'without a bidExit on its collection',
+      [bid],
+      { resaleLimit: '1' },
+      'needs a listing with bidExit',
+    ],
+  ] as const)('rejects a resaleBid %s', (_case, tasks, overrides, message) => {
+    expect(() => tasksFileOf([...tasks], { lossLimits, ...overrides })).toThrow(message);
+  });
+});
+
 describe('parseTasksFile listings', () => {
   test('reads the token id into a bigint and fills the defaults', () => {
     expect(listingTaskOf()).toMatchObject({
@@ -131,6 +203,31 @@ describe('parseTasksFile listings', () => {
     expect(listingTaskOf({ tokenId: undefined }).tokenId).toBeUndefined();
   });
 
+  test('marks an OpenSea listing up 3% for an hour by default', () => {
+    expect(listingTaskOf({ tokenId: undefined, openSeaListing: {} }).openSeaListing).toEqual({
+      markupPercent: 3,
+      expirationMinutes: 60,
+    });
+  });
+
+  test('lends 90% of the listing price at 1% APR and a 0.25% fee for 3 days by default, offers lasting 10 minutes', () => {
+    expect(listingTaskOf({ tokenId: undefined, loanOffer: {} }).loanOffer).toEqual({
+      principalPercent: 90,
+      aprPercent: 1,
+      originationFeePercent: 0.25,
+      durationDays: 3,
+      expirationMinutes: 10,
+    });
+  });
+
+  test.each([3, 7, 45, 60])('takes a loan of %i days, which GONDI offers', (durationDays) => {
+    expect(
+      listingTaskOf({ tokenId: undefined, loanOffer: { durationDays } }).loanOffer,
+    ).toMatchObject({
+      durationDays,
+    });
+  });
+
   test.each([
     ['a token id that is not a number', { tokenId: '#3950' }],
     ['a minimum above the maximum', { minPrice: '13' }],
@@ -139,6 +236,27 @@ describe('parseTasksFile listings', () => {
     ['an undercut of 0 ETH', { pricing: { mode: 'undercut', amount: '0' } }],
     ['a bid pricing mode', { pricing: { mode: 'outbid' } }],
     ['an expiration under 5 minutes', { expirationMinutes: 4 }],
+    ['an OpenSea listing of one token id', { openSeaListing: {} }],
+    ['an OpenSea markup of 0', { tokenId: undefined, openSeaListing: { markupPercent: 0 } }],
+    [
+      'an OpenSea listing under 15 minutes',
+      { tokenId: undefined, openSeaListing: { expirationMinutes: 10 } },
+    ],
+    ['a loan offer on one token id', { loanOffer: {} }],
+    ['a loan of 0% of the price', { tokenId: undefined, loanOffer: { principalPercent: 0 } }],
+    [
+      'a loan of over 100% of the price',
+      { tokenId: undefined, loanOffer: { principalPercent: 101 } },
+    ],
+    ['a loan offer under 10 minutes', { tokenId: undefined, loanOffer: { expirationMinutes: 9 } }],
+    [
+      'a loan of 2 days, which GONDI does not offer',
+      { tokenId: undefined, loanOffer: { durationDays: 2 } },
+    ],
+    ['a loan fee over 10%', { tokenId: undefined, loanOffer: { originationFeePercent: 11 } }],
+    ['a decay of 0%', { decay: { percent: 0, everyHours: 6 } }],
+    ['a decay over 100%', { decay: { percent: 101, everyHours: 6 } }],
+    ['a decay every 0 hours', { decay: { percent: 5, everyHours: 0 } }],
   ])('rejects %s', (_case, overrides) => {
     expect(() => listingTaskOf(overrides)).toThrow();
   });

@@ -1,13 +1,13 @@
 import { formatEther } from 'viem';
 
+import { BPS } from './basisPoints';
 import type { Fill, SaleTerms } from './market';
 import type { LossLimits } from './task';
 
-const BPS = 10_000n;
 const DAY_MS = 24 * 60 * 60_000;
 
-/** An item the wallet bought since `since` and has not sold since. */
-export type Position = { slug: string; tokenId: bigint; cost: bigint };
+/** An item the wallet bought since `since` and has not sold since, and when it bought it. */
+export type Position = { slug: string; tokenId: bigint; cost: bigint; boughtAt: Date };
 
 /** A sale of an item the wallet bought since `since`, beside what it paid for it. */
 export type ClosedSale = { slug: string; price: bigint; cost: bigint; timestamp: Date };
@@ -51,7 +51,12 @@ export const ledgerOf = (fills: Fill[], since: Date): Ledger => {
   for (const fill of ordered) {
     const key = itemKey(fill);
     if (fill.side === 'buy') {
-      open.set(key, { slug: fill.slug, tokenId: fill.tokenId, cost: fill.price });
+      open.set(key, {
+        slug: fill.slug,
+        tokenId: fill.tokenId,
+        cost: fill.price,
+        boughtAt: fill.timestamp,
+      });
       continue;
     }
     const position = open.get(key);

@@ -38,8 +38,14 @@ const api: DesktopApi = {
   profile: () => ipcRenderer.invoke(INVOKE_CHANNELS.profile),
   collections: () => ipcRenderer.invoke(INVOKE_CHANNELS.collections),
   searchCollections: (query) => ipcRenderer.invoke(INVOKE_CHANNELS.searchCollections, query),
-  collectionPricing: (slug, venue) =>
-    ipcRenderer.invoke(INVOKE_CHANNELS.collectionPricing, slug, venue),
+  collectionPricing: (slug, venue, trait) =>
+    ipcRenderer.invoke(INVOKE_CHANNELS.collectionPricing, slug, venue, trait),
+  collectionTraits: (slug) => ipcRenderer.invoke(INVOKE_CHANNELS.collectionTraits, slug),
+  availableUpdate: () => ipcRenderer.invoke(INVOKE_CHANNELS.availableUpdate),
+  openLatestRelease: () => ipcRenderer.invoke(INVOKE_CHANNELS.openLatestRelease),
+  usageStatistics: () => ipcRenderer.invoke(INVOKE_CHANNELS.usageStatistics),
+  setUsageStatistics: (enabled) => ipcRenderer.invoke(INVOKE_CHANNELS.setUsageStatistics, enabled),
+  acknowledgeUsageNotice: () => ipcRenderer.invoke(INVOKE_CHANNELS.acknowledgeUsageNotice),
   onStatus: (listener) => {
     const forward = (_event: unknown, status: DesktopStatus) => listener(status);
     ipcRenderer.on(STATUS_CHANNEL, forward);

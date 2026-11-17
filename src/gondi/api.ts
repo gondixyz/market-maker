@@ -1,5 +1,7 @@
-import type { Address, Hex } from 'viem';
+import { type Address, type Hex, isAddressEqual } from 'viem';
 import { z } from 'zod';
+
+import type { Trait } from '../engine/market';
 
 const DEFAULT_API_URL = 'https://api2.gondi.xyz/lending/graphql';
 
@@ -16,6 +18,8 @@ export type OrdersFilter = {
   makers?: Address[];
   excludeMakers?: Address[];
   currencies?: Address[];
+  /** The marketplaces the orders were made on; every marketplace when left out. */
+  marketplaces?: 'NATIVE'[];
   /** Defaults to active orders only. */
   statuses?: OrderStatus[];
   /** `ANY` lists every bid an item of `collections` can fill; `ALL`, the default, those scoped to it. */
@@ -46,27 +50,30 @@ const order = z.object({
   maxExecutions: z.number(),
   cancelsOffChain: z.boolean(),
   marketPlace: z.string(),
+  marketPlaceAddress: address,
+  originalId: z.string(),
   nft: z.object({ id: z.string().transform(Number), tokenId: amount }).optional(),
   collectionId: z.number().optional(),
+  traitId: z.number().optional(),
 });
 
 const ORDER_FIELDS = `
   __typename id price steppedPrice currencyAddress maker isAsk status startTime expiration
-  executions maxExecutions cancelsOffChain marketPlace
+  executions maxExecutions cancelsOffChain marketPlace marketPlaceAddress originalId
   ... on SingleNFTOrder { nft { id tokenId } }
   ... on CollectionOrder { collectionId }
-  ... on TraitOrder { collectionId }
+  ... on TraitOrder { collectionId traitId }
   ... on MultipleTraitOrder { collectionId }
   ... on SetBidOrder { collectionId }`;
 
 const ORDERS_QUERY = `query orders($side: OrderSide, $collectionIds: [Int!], $traitIds: [Int!],
   $nfts: [OrderForNft!], $maker: [Address!], $excludeMaker: [Address!], $currencyAddresses: [Address!],
-  $statuses: [OrderStatusType!], $matchMode: OrderMatchMode!, $orderTypes: [CollectionOrderType!],
-  $sortBy: [OrderSortInput!], $first: Int, $after: String) {
+  $marketplaces: [MarketPlaceType!], $statuses: [OrderStatusType!], $matchMode: OrderMatchMode!,
+  $orderTypes: [CollectionOrderType!], $sortBy: [OrderSortInput!], $first: Int, $after: String) {
   result: listOrdersV2(side: $side, collectionIds: $collectionIds, traitIds: $traitIds, nfts: $nfts,
     maker: $maker, excludeMaker: $excludeMaker, currencyAddresses: $currencyAddresses,
-    statuses: $statuses, matchMode: $matchMode, orderTypes: $orderTypes, sortBy: $sortBy,
-    first: $first, after: $after) {
+    marketplaces: $marketplaces, statuses: $statuses, matchMode: $matchMode, orderTypes: $orderTypes,
+    sortBy: $sortBy, first: $first, after: $after) {
     edges { node { ${ORDER_FIELDS} } }
     pageInfo { hasNextPage endCursor }
   }
@@ -78,7 +85,6 @@ const COLLECTION_MARKET_QUERY = `query collectionMarket($slug: String!, $currenc
     royalties { beneficiary percentage required }
     statistics {
       minAskPrice(currencyAddresses: $currencyAddresses) { amount }
-      highestApplicableBid { ${ORDER_FIELDS} }
     }
   }
 }`;
@@ -94,7 +100,7 @@ const NFT_ID_QUERY = `query nftId($slug: String!, $tokenId: BigInt!) {
 const HELD_NFTS_QUERY = `query heldNfts($slug: String!, $owner: Address!, $after: String) {
   nfts: listNfts(slugs: [$slug], ownersFilter: { owners: [$owner], withInWallet: true },
     first: 100, after: $after) {
-    edges { node { tokenId } }
+    edges { node { tokenId traits { key value } } }
     pageInfo { hasNextPage endCursor }
   }
 }`;
@@ -179,13 +185,19 @@ const collectionMarketResult = z.object({
       ),
       statistics: z.object({
         minAskPrice: z.object({ amount }).nullable(),
-        highestApplicableBid: order.nullable(),
       }),
     })
     .nullable(),
 });
 
-const heldNftsResult = z.object({ nfts: connection(z.object({ tokenId: amount })) });
+const heldNftsResult = z.object({
+  nfts: connection(
+    z.object({
+      tokenId: amount,
+      traits: z.array(z.object({ key: z.string(), value: z.string() })),
+    }),
+  ),
+});
 const sale = z.object({
   price: amount,
   currencyAddress: address,
@@ -250,6 +262,54 @@ const profileResult = z.object({
 });
 const saleFeesResult = z.object({ fees: z.array(z.object({ bps: amount })) });
 const priceStepResult = z.object({ steps: z.object({ wethStep: amount }) });
+const TRAIT_VALUES_QUERY = `query traitValues($collectionId: Int!, $keys: [String!],
+  $searchTerm: String, $after: String) {
+  values: listCollectionTraitValues(collectionIds: [$collectionId], key: $keys,
+    searchTerm: $searchTerm, first: 40, after: $after) {
+    edges { node { id key value statistics { floorPrice { amount currency { address } } } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+
+const COLLECTION_TRAITS_QUERY = `query collectionTraits($collectionId: Int!, $after: String) {
+  values: listCollectionTraitValues(collectionIds: [$collectionId], first: 40, after: $after) {
+    edges { node { key value } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+
+const traitValuesResult = z.object({
+  values: connection(
+    z.object({
+      id: z.string().transform(Number),
+      key: z.string(),
+      value: z.string(),
+      statistics: z.object({
+        floorPrice: z.object({ amount: z.number(), currency: z.object({ address }) }).nullable(),
+      }),
+    }),
+  ),
+});
+
+const collectionTraitsResult = z.object({
+  values: connection(z.object({ key: z.string(), value: z.string() })),
+});
+
+/** The most trait values `collectionTraits` reads: 25 pages of the API's 40. */
+const MAX_TRAIT_VALUES = 1_000;
+
+/**
+ * A trait's GONDI id and its floor: the cheapest listing of an item with it, `null` unlisted or
+ * listed cheapest in a currency other than those asked for.
+ */
+export type TraitMarket = { traitId: number; floorPrice: bigint | null };
+
+/** An item a wallet holds, as the owners index shows it. */
+export type HeldNft = { tokenId: bigint; traits: Trait[] };
+
+/** ETH as the API's floats carry it, in wei, to the gwei: past that a float only adds noise. */
+const weiOfEth = (eth: number) => BigInt(Math.round(eth * 1e9)) * 10n ** 9n;
+
 const nftIdResult = z.object({ nft: z.object({ id: z.string().transform(Number) }).nullable() });
 
 export type ApiOrder = z.output<typeof order>;
@@ -262,17 +322,22 @@ export type CollectionMarket = {
   seaportConduitKey: Hex;
   /** The cheapest active listing in the requested currencies, or `null` when nothing is listed. */
   floorPrice: bigint | null;
-  highestBid: ApiOrder | null;
   royalties: { beneficiary: Address; percentage: number; required: boolean }[];
 };
 
 /** The reads a market maker prices from, which a stand-in such as `PriceReplay` can serve. */
-export type PriceApi = Pick<GondiApi, 'collectionMarket' | 'orders' | 'currencyUsdPrice'>;
+export type PriceApi = Pick<
+  GondiApi,
+  'collectionMarket' | 'orders' | 'currencyUsdPrice' | 'traitMarket'
+>;
 
 /**
- * Reads the market from GONDI's public lending API: the order book, a collection's floor, highest
- * bid, royalties, contract and price step, and an item's GONDI id. Reads need no sign-in, so they
- * never go through the SDK's session; the SDK is used only to sign, publish and cancel.
+ * Reads the market from GONDI's public lending API: the order book, a collection's floor,
+ * royalties, contract and price step, and an item's GONDI id. Reads need no sign-in, so they
+ * never go through the SDK's session; the SDK is used only to sign, publish and cancel. That holds
+ * for the reads the SDK also offers (`Gondi.orders`, `Gondi.collectionMarket`) too: the SDK signs
+ * the wallet in before any call, and returns the floor as `{ amount, currency }` rather than the
+ * `bigint` wei the engine prices in.
  *
  * IMPLEMENTATION NOTE: every read is a GraphQL POST to `<apiUrl>` with `{ query, variables }`, and
  * the response's `data` is parsed here into exact types, failing loudly on a shape it does not
@@ -341,7 +406,6 @@ export class GondiApi {
       contractAddress: collection.contractData.contractAddress,
       seaportConduitKey: collection.seaportConduitKey,
       floorPrice: collection.statistics.minAskPrice?.amount ?? null,
-      highestBid: collection.statistics.highestApplicableBid,
       royalties: collection.royalties,
     };
   }
@@ -350,6 +414,56 @@ export class GondiApi {
   async priceStep(collectionId: number): Promise<bigint> {
     return priceStepResult.parse(await this.query(PRICE_STEP_QUERY, { collectionId })).steps
       .wethStep;
+  }
+
+  /**
+   * The GONDI id and the floor of `trait` on the collection, `null` when its cheapest listing is in
+   * a currency outside `currencies`. Throws for a trait the collection's items do not have.
+   *
+   * IMPLEMENTATION NOTE: `listCollectionTraitValues(collectionIds, key, searchTerm)` matches the
+   * value by search, so the exact value is picked from what it returns; it serves at most 40 values
+   * a page. Its `id` is the `traitId` a `TraitOrder` carries and `listOrdersV2(traitIds:)` filters
+   * by. `statistics.floorPrice` is the cheapest listing of an item with the trait, `null` with none
+   * listed: `amount` is a float in the units of its `currency`, the currency whose cheapest listing
+   * is worth the least in ETH, so a floor listed in USDC reads in USDC. Unlike the collection's
+   * `minAskPrice(currencyAddresses:)`, it takes no currency filter.
+   */
+  async traitMarket(
+    collectionId: number,
+    trait: Trait,
+    currencies: Address[],
+  ): Promise<TraitMarket> {
+    const values = await this.allPages(
+      async (after) =>
+        traitValuesResult.parse(
+          await this.query(TRAIT_VALUES_QUERY, {
+            collectionId,
+            keys: [trait.type],
+            searchTerm: trait.value,
+            after,
+          }),
+        ).values,
+      (read) => read.some((value) => value.value === trait.value),
+    );
+    const match = values.find((value) => value.key === trait.type && value.value === trait.value);
+    if (!match) throw new Error(`unknown trait ${trait.type}: ${trait.value}`);
+    const floor = match.statistics.floorPrice;
+    const inCurrencies =
+      floor !== null &&
+      currencies.some((currency) => isAddressEqual(currency, floor.currency.address));
+    return { traitId: match.id, floorPrice: inCurrencies ? weiOfEth(floor.amount) : null };
+  }
+
+  /** The collection's traits, each value once, up to `MAX_TRAIT_VALUES` of them. */
+  async collectionTraits(collectionId: number): Promise<Trait[]> {
+    const values = await this.allPages(
+      async (after) =>
+        collectionTraitsResult.parse(
+          await this.query(COLLECTION_TRAITS_QUERY, { collectionId, after }),
+        ).values,
+      (read) => read.length >= MAX_TRAIT_VALUES,
+    );
+    return values.map(({ key, value }) => ({ type: key, value }));
   }
 
   /** An item's GONDI id. Throws for an item GONDI does not know. */
@@ -362,15 +476,22 @@ export class GondiApi {
   }
 
   /**
-   * The token ids of the collection's items `owner` holds in its wallet (not lent, vaulted or
-   * stashed), every page of them. The owners index trails a transfer by up to a minute.
+   * The collection's items `owner` holds in its wallet (not lent, vaulted or stashed), with their
+   * traits, every page of them. The owners index trails a transfer by up to a minute.
+   *
+   * IMPLEMENTATION NOTE: the items are read with their traits for the caller to match a trait, not
+   * with `listNfts(traits:)`: that filter beside `ownersFilter` took 2 s for an owner of 181 items
+   * and 22 s for one of none, against 0.3 s for the plain read (production, 2026-11-12).
    */
-  async heldNfts({ slug, owner }: { slug: string; owner: Address }): Promise<bigint[]> {
+  async heldNfts({ slug, owner }: { slug: string; owner: Address }): Promise<HeldNft[]> {
     const nfts = await this.allPages(
       async (after) =>
         heldNftsResult.parse(await this.query(HELD_NFTS_QUERY, { slug, owner, after })).nfts,
     );
-    return nfts.map((nft) => nft.tokenId);
+    return nfts.map(({ tokenId, traits }) => ({
+      tokenId,
+      traits: traits.map(({ key, value }) => ({ type: key, value })),
+    }));
   }
 
   /**
@@ -542,6 +663,7 @@ export class GondiApi {
         maker: filter.makers,
         excludeMaker: filter.excludeMakers,
         currencyAddresses: filter.currencies,
+        marketplaces: filter.marketplaces,
         statuses: filter.statuses ?? ['Active'],
         matchMode: filter.matchMode ?? 'ALL',
         orderTypes: filter.orderTypes,

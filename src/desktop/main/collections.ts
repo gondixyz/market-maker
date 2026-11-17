@@ -1,4 +1,5 @@
-import type { TopCollection } from '../../gondi/api';
+import type { Trait } from '../../engine/market';
+import type { GondiApi, TopCollection } from '../../gondi/api';
 import type { CollectionOption } from '../api';
 import { inlineImage } from './inlineImage';
 
@@ -43,4 +44,13 @@ export const pickableCollections = async (
         : null,
     })),
   );
+};
+
+/** The traits of the collection `slug` names, each value once, for the trait bid picker. */
+export const collectionTraits = async (
+  api: Pick<GondiApi, 'collectionMarket' | 'collectionTraits'>,
+  slug: string,
+): Promise<Trait[]> => {
+  const { collectionId } = await api.collectionMarket({ slug });
+  return api.collectionTraits(collectionId);
 };

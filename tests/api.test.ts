@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test';
+import type { Address } from 'viem';
 
 import { GondiApi } from '../src/gondi/api';
 
@@ -22,6 +23,8 @@ const ORDER = {
   maxExecutions: 1,
   cancelsOffChain: false,
   marketPlace: 'MarketPlace.OpenSea',
+  marketPlaceAddress: '0x0000000000000068f116a894984e2db1123eb395',
+  originalId: '0x8c6a3a0f3c4f0e4b7c2a1f9d6e5b4a3928171615141312111009080706050403',
   collectionId: 2173,
 };
 
@@ -162,7 +165,21 @@ describe('GondiApi', () => {
     });
   });
 
-  test('reads a collection market with a null floor and bid', async () => {
+  test('sends the marketplaces the filter names', async () => {
+    const post = respond({ data: { result: { edges: [], pageInfo: LAST_PAGE } } });
+
+    await new GondiApi('https://api.test', post).orders({ side: 'BID', marketplaces: ['NATIVE'] });
+
+    const [, init] = (post as unknown as ReturnType<typeof mock>).mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    const body = JSON.parse(init.body as string);
+    expect(body.query).toContain('marketplaces: $marketplaces');
+    expect(body.variables).toMatchObject({ marketplaces: ['NATIVE'] });
+  });
+
+  test('reads a collection market with a null floor', async () => {
     const api = new GondiApi(
       'https://api.test',
       respond({
@@ -172,7 +189,7 @@ describe('GondiApi', () => {
             seaportConduitKey: '0x00',
             contractData: { contractAddress: '0xbd3531da5cf5857e7cfaa92426877b022e612cf8' },
             royalties: [],
-            statistics: { minAskPrice: null, highestApplicableBid: null },
+            statistics: { minAskPrice: null },
           },
         },
       }),
@@ -181,7 +198,6 @@ describe('GondiApi', () => {
     expect(await api.collectionMarket({ slug: 'pudgypenguins' })).toMatchObject({
       collectionId: 2173,
       floorPrice: null,
-      highestBid: null,
     });
   });
 
@@ -191,7 +207,7 @@ describe('GondiApi', () => {
         JSON.stringify({
           data: {
             nfts: {
-              edges: tokenIds.map((tokenId) => ({ node: { tokenId } })),
+              edges: tokenIds.map((tokenId) => ({ node: { tokenId, traits: [] } })),
               pageInfo: { hasNextPage, endCursor: tokenIds.at(-1) },
             },
           },
@@ -201,17 +217,115 @@ describe('GondiApi', () => {
       .mockResolvedValueOnce(page(['8128', '6580'], true))
       .mockResolvedValueOnce(page(['3950'], false));
 
-    const tokenIds = await new GondiApi(
-      'https://api.test',
-      post as unknown as typeof fetch,
-    ).heldNfts({ slug: 'pudgypenguins', owner: '0x59f3eb596b0af6ebb197362c5f191a9abadd4f7b' });
+    const items = await new GondiApi('https://api.test', post as unknown as typeof fetch).heldNfts({
+      slug: 'pudgypenguins',
+      owner: '0x59f3eb596b0af6ebb197362c5f191a9abadd4f7b',
+    });
 
-    expect(tokenIds).toEqual([8128n, 6580n, 3950n]);
+    expect(items.map((item) => item.tokenId)).toEqual([8128n, 6580n, 3950n]);
     expect(JSON.parse(post.mock.calls[1][1].body).variables).toMatchObject({
       slug: 'pudgypenguins',
       owner: '0x59f3eb596b0af6ebb197362c5f191a9abadd4f7b',
       after: '6580',
     });
+  });
+
+  test('reads the traits of the items an owner holds as type and value', async () => {
+    const api = new GondiApi(
+      'https://api.test',
+      respond({
+        data: {
+          nfts: {
+            edges: [{ node: { tokenId: '1', traits: [{ key: 'Background', value: 'Blue' }] } }],
+            pageInfo: LAST_PAGE,
+          },
+        },
+      }),
+    );
+
+    expect(
+      await api.heldNfts({
+        slug: 'pudgypenguins',
+        owner: '0x59f3eb596b0af6ebb197362c5f191a9abadd4f7b',
+      }),
+    ).toEqual([{ tokenId: 1n, traits: [{ type: 'Background', value: 'Blue' }] }]);
+  });
+
+  describe('traitMarket', () => {
+    const ETH = '0x0000000000000000000000000000000000000000';
+    const WETH = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
+    const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+    const CURRENCIES: Address[] = [ETH, WETH];
+    const BLUE = { type: 'Background', value: 'Blue' };
+    const value = (
+      id: string,
+      key: string,
+      valueName: string,
+      floor: number | null,
+      currency = ETH,
+    ) => ({
+      node: {
+        id,
+        key,
+        value: valueName,
+        statistics: {
+          floorPrice: floor === null ? null : { amount: floor, currency: { address: currency } },
+        },
+      },
+    });
+    const traitsApi = (...edges: object[]) =>
+      new GondiApi(
+        'https://api.test',
+        respond({ data: { values: { edges, pageInfo: LAST_PAGE } } }),
+      );
+
+    test('picks the exact value the search returns, with its floor in wei', async () => {
+      const api = traitsApi(
+        value('1', 'Background', 'Blue Sky', 3),
+        value('12276798', 'Background', 'Blue', 2.414),
+      );
+
+      expect(await api.traitMarket(2_173, BLUE, CURRENCIES)).toEqual({
+        traitId: 12_276_798,
+        floorPrice: 2_414_000_000_000_000_000n,
+      });
+    });
+
+    test('reads no floor for a trait nobody lists', async () => {
+      const api = traitsApi(value('5', 'Background', 'Blue', null));
+
+      expect((await api.traitMarket(2_173, BLUE, CURRENCIES)).floorPrice).toBeNull();
+    });
+
+    test('reads no floor when the cheapest listing is in another currency', async () => {
+      const api = traitsApi(value('5', 'Background', 'Blue', 7_000, USDC));
+
+      expect((await api.traitMarket(2_173, BLUE, CURRENCIES)).floorPrice).toBeNull();
+    });
+
+    test('throws for a trait the collection does not have', async () => {
+      const api = traitsApi(value('1', 'Background', 'Blue Sky', 3));
+
+      await expect(api.traitMarket(2_173, BLUE, CURRENCIES)).rejects.toThrow(
+        'unknown trait Background: Blue',
+      );
+    });
+  });
+
+  test("reads a collection's traits as type and value", async () => {
+    const api = new GondiApi(
+      'https://api.test',
+      respond({
+        data: {
+          values: {
+            edges: [{ node: { key: 'Background', value: 'Blue' } }],
+            pageInfo: LAST_PAGE,
+          },
+        },
+      }),
+    );
+
+    expect(await api.collectionTraits(2_173)).toEqual([{ type: 'Background', value: 'Blue' }]);
   });
 
   test("pages through a user's sales since a moment, read in Unix seconds", async () => {

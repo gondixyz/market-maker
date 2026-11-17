@@ -1,4 +1,4 @@
-import type { Venue } from '../engine/market';
+import type { Trait, Venue } from '../engine/market';
 import type { TaskState } from '../engine/runner';
 
 /** One task as the window shows it: plain strings, so nothing but display data leaves main. */
@@ -68,6 +68,12 @@ export type ApprovalResult = { outcome: 'sent'; transactionHash: string } | { ou
 /** How a collection approval went: already in place (nothing asked or sent), declined, or sent. */
 export type CollectionApprovalResult = ApprovalResult | { outcome: 'alreadyApproved' };
 
+/**
+ * The user's choice about anonymous usage statistics, and whether the first-run notice about them
+ * has been answered.
+ */
+export type UsageStatistics = { enabled: boolean; noticeShown: boolean };
+
 /** The only calls the window can make into main; `preload` exposes exactly these. */
 export interface DesktopApi {
   status(): Promise<DesktopStatus>;
@@ -116,12 +122,25 @@ export interface DesktopApi {
   /** The pickable collections whose name or slug `query` matches, most traded first. */
   searchCollections(query: string): Promise<CollectionOption[]>;
   /**
-   * The `slug` collection's price step on `venue`, its floor and its top bid; rejects for one GONDI
-   * does not know.
+   * The `slug` collection's price step on `venue`, its floor and its top bid, or, with a `trait`,
+   * the trait's floor and the top bid an item with it sells into; rejects for a collection or trait
+   * GONDI does not know.
    */
-  collectionPricing(slug: string, venue: Venue): Promise<CollectionPricing>;
+  collectionPricing(slug: string, venue: Venue, trait?: Trait): Promise<CollectionPricing>;
+  /** The traits of the collection `slug` names, each value once, for a trait bid to pick from. */
+  collectionTraits(slug: string): Promise<Trait[]>;
   /** The stored key's wallet's GONDI name and picture; rejects without a key. */
   profile(): Promise<WalletProfile>;
+  /** The latest release's version when it is newer than this app; `null` when up to date. */
+  availableUpdate(): Promise<string | null>;
+  /** Opens the latest release's download page in the default browser. */
+  openLatestRelease(): Promise<void>;
+  /** Whether anonymous usage statistics are on, and whether their notice has been answered. */
+  usageStatistics(): Promise<UsageStatistics>;
+  /** Turns anonymous usage statistics on or off, which also answers their notice. */
+  setUsageStatistics(enabled: boolean): Promise<UsageStatistics>;
+  /** Answers the usage statistics notice with "OK", leaving them on. */
+  acknowledgeUsageNotice(): Promise<UsageStatistics>;
   onStatus(listener: (status: DesktopStatus) => void): () => void;
 }
 
@@ -150,6 +169,12 @@ export const INVOKE_CHANNELS = {
   collections: 'market-maker:collections',
   searchCollections: 'market-maker:search-collections',
   collectionPricing: 'market-maker:collection-pricing',
+  collectionTraits: 'market-maker:collection-traits',
+  availableUpdate: 'market-maker:available-update',
+  openLatestRelease: 'market-maker:open-latest-release',
+  usageStatistics: 'market-maker:usage-statistics',
+  setUsageStatistics: 'market-maker:set-usage-statistics',
+  acknowledgeUsageNotice: 'market-maker:acknowledge-usage-notice',
 } as const satisfies Record<Exclude<keyof DesktopApi, 'onStatus'>, string>;
 
 /** Main pushes a fresh `DesktopStatus` on this channel whenever a task changes state. */

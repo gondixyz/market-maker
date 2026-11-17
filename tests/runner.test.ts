@@ -2,7 +2,15 @@ import { describe, expect, spyOn, test } from 'bun:test';
 
 import { type RoundReport, Runner } from '../src/engine/runner';
 import { VenueMarket } from '../src/engine/venueMarket';
-import { bidOf, eth, FakeMarket, listingTaskJson, tasksFileOf } from './fakeMarket';
+import {
+  bidOf,
+  eth,
+  FakeLendingMarket,
+  FakeMarket,
+  listingTaskJson,
+  loanOfferOf,
+  tasksFileOf,
+} from './fakeMarket';
 
 const task = (id: string, overrides: object = {}) => ({
   id,
@@ -56,6 +64,18 @@ describe('Runner', () => {
       venue: 'gondi',
       levels: 2,
     });
+  });
+
+  test('bids a trait task on its trait, as the scope names it', async () => {
+    const market = new FakeMarket();
+    const trait = { type: 'Background', value: 'Blue' };
+    const runner = runnerFor(market, [task('blue', { kind: 'traitBid', trait })]);
+
+    await runner.round();
+
+    expect(market.placed.map((bid) => bid.scope)).toEqual([
+      { kind: 'trait', trait, slug: 'pudgypenguins', venue: 'gondi' },
+    ]);
   });
 
   test('fails an OpenSea task without an OpenSea venue, and runs the rest', async () => {
@@ -180,8 +200,8 @@ describe('Runner', () => {
 
     expect(market.placed.map((bid) => bid.price)).toEqual([
       eth('8.01'),
-      eth('8'),
       eth('7.5'),
+      eth('7'),
       eth('8.01'),
     ]);
     expect(runner.states().get('ladder')).toEqual({
@@ -192,13 +212,55 @@ describe('Runner', () => {
     });
   });
 
+  test('counts a GONDI and an OpenSea bid on one collection as the larger one', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    openSea.market.competingBidLevels = [eth('8.5'), eth('8.2')];
+    const runner = new Runner(
+      new VenueMarket(gondi, { gondi, opensea: openSea }),
+      tasksFileOf(
+        [
+          task('gondi', { maxItems: 1 }),
+          openSeaTask('openSea'),
+          task('azuki', { collection: 'azuki' }),
+          task('bayc', { collection: 'boredapeyachtclub' }),
+        ],
+        { exposureLimit: '16.3' },
+      ),
+      NOW,
+      () => NOW,
+    );
+
+    const reports: RoundReport[] = [];
+    runner.on('round', (report) => reports.push(report));
+
+    await runner.round();
+
+    expect([
+      gondi.placed.map((bid) => [bid.scope.slug, bid.price]),
+      openSea.placed.map((bid) => bid.price),
+      runner.states().get('bayc'),
+      reports[0].committed,
+    ]).toEqual([
+      [
+        ['pudgypenguins', eth('8.01')],
+        ['azuki', eth('8.01')],
+      ],
+      [eth('8.2')],
+      { status: 'waiting', reason: 'exposureLimit' },
+      eth('16.21'),
+    ]);
+  });
+
   test('counts an offer a wait leaves up against the exposure limit of the other tasks', async () => {
     const gondi = new FakeMarket();
     const openSea = new FakeMarket();
     openSea.market.competingBidLevels = [eth('8.5'), eth('8.2')];
     const runner = new Runner(
       new VenueMarket(gondi, { gondi, opensea: openSea }),
-      tasksFileOf([openSeaTask('ad'), task('punks')], { exposureLimit: '10' }),
+      tasksFileOf([openSeaTask('ad'), task('punks', { collection: 'azuki' })], {
+        exposureLimit: '10',
+      }),
       NOW,
       () => NOW,
     );
@@ -667,6 +729,55 @@ describe('Runner with an inventory listing', () => {
     ]);
   });
 
+  test('lowers each item from when this run first found it held', async () => {
+    const market = new FakeMarket();
+    market.heldTokenIds = [1n];
+    let now = NOW;
+    const decaying = inventory();
+    const file = tasksFileOf([
+      {
+        ...decaying,
+        pricing: { mode: 'fixed', price: '12' },
+        decay: { percent: 10, everyHours: 1 },
+      },
+    ]);
+    const runner = new Runner(market, file, NOW, () => now);
+    await runner.round();
+    now = new Date(NOW.getTime() + 60 * 60_000);
+    market.heldTokenIds = [1n, 2n];
+
+    await runner.round();
+
+    expect(market.placedListings.map((listing) => [listing.scope.tokenId, listing.price])).toEqual([
+      [1n, eth('12')],
+      [1n, eth('10.8')],
+      [2n, eth('12')],
+    ]);
+  });
+
+  test('starts an item that left the wallet and came back at the full price again', async () => {
+    const market = new FakeMarket();
+    market.heldTokenIds = [1n];
+    let now = NOW;
+    const file = tasksFileOf([
+      {
+        ...inventory(),
+        pricing: { mode: 'fixed', price: '12' },
+        decay: { percent: 10, everyHours: 1 },
+      },
+    ]);
+    const runner = new Runner(market, file, NOW, () => now);
+    await runner.round();
+    now = new Date(NOW.getTime() + 2 * 60 * 60_000);
+    market.heldTokenIds = [];
+    await runner.round();
+    market.heldTokenIds = [1n];
+
+    await runner.round();
+
+    expect(market.placedListings.at(-1)?.price).toEqual(eth('12'));
+  });
+
   test('picks up an item the bot bought and drops one that sold, without halting', async () => {
     const market = new FakeMarket();
     market.heldTokenIds = [1n];
@@ -729,6 +840,337 @@ describe('Runner with an inventory listing', () => {
   });
 });
 
+describe('Runner with an OpenSea listing', () => {
+  const mirrored = (openSeaListing: object = {}) =>
+    listingTaskJson({ id: 'pudgy-all', tokenId: undefined, openSeaListing });
+
+  test('lists each held item on OpenSea at the markup over its GONDI listing', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    gondi.heldTokenIds = [1n, 2n];
+    const reports: unknown[] = [];
+    const runner = venueRunnerFor(gondi, openSea, [mirrored({ markupPercent: 5 })]);
+    runner.on('mirror', (report) => reports.push(report));
+
+    await runner.round();
+
+    expect(openSea.placedMirrors.map(({ scope, price }) => [scope.tokenId, price])).toEqual([
+      [1n, eth('10.4895')],
+      [2n, eth('10.4895')],
+    ]);
+    expect(reports).toEqual([
+      { status: 'listed', taskId: 'pudgy-all', tokenId: 1n, price: eth('10.4895') },
+      { status: 'listed', taskId: 'pudgy-all', tokenId: 2n, price: eth('10.4895') },
+    ]);
+  });
+
+  test('keeps the OpenSea listing while the GONDI one stands', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    gondi.heldTokenIds = [1n];
+    const runner = venueRunnerFor(gondi, openSea, [mirrored()]);
+    await runner.round();
+
+    await runner.round();
+
+    expect(openSea.placedMirrors).toHaveLength(1);
+    expect(openSea.cancelledMirrors).toEqual([]);
+  });
+
+  test('follows a cheaper GONDI listing and cancels the older OpenSea one', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    gondi.heldTokenIds = [1n];
+    const runner = venueRunnerFor(gondi, openSea, [mirrored()]);
+    await runner.round();
+    gondi.listingBook = { ...gondi.listingBook, lowestCompetingAsk: eth('9.5') };
+
+    await runner.round();
+
+    expect(openSea.placedMirrors.map((listing) => listing.price)).toEqual([
+      eth('10.2897'),
+      eth('9.7747'),
+    ]);
+    expect(openSea.cancelledMirrors).toEqual(['mirror-100']);
+  });
+
+  test('cancels the OpenSea listing of an item the wallet no longer holds', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    gondi.heldTokenIds = [1n];
+    const runner = venueRunnerFor(gondi, openSea, [mirrored()]);
+    await runner.round();
+    gondi.heldTokenIds = [];
+
+    await runner.round();
+
+    expect(openSea.cancelledMirrors).toEqual(['mirror-100']);
+    expect(openSea.mirrors).toEqual([]);
+  });
+
+  test('leaves the OpenSea listing of an item whose GONDI read fails', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    gondi.heldTokenIds = [1n];
+    const runner = venueRunnerFor(gondi, openSea, [mirrored()]);
+    await runner.round();
+    gondi.failingTokenIds = [1n];
+
+    await runner.round();
+
+    expect(openSea.cancelledMirrors).toEqual([]);
+  });
+
+  test('keeps the OpenSea listing when refreshing the live GONDI listing fails', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    gondi.heldTokenIds = [1n];
+    const runner = venueRunnerFor(gondi, openSea, [mirrored()]);
+    await runner.round();
+    gondi.ownListings[0].expiration = new Date(NOW.getTime() + 60_000);
+    gondi.failPlaceListing = true;
+
+    await runner.round();
+
+    expect([openSea.placedMirrors.length, openSea.cancelledMirrors]).toEqual([1, []]);
+  });
+
+  test('a failed OpenSea read is reported and leaves the GONDI listings as they are', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    openSea.failMirrors = true;
+    gondi.heldTokenIds = [1n];
+    const reports: unknown[] = [];
+    const runner = venueRunnerFor(gondi, openSea, [mirrored()]);
+    runner.on('mirror', (report) => reports.push(report));
+
+    await runner.round();
+
+    expect(gondi.placedListings).toHaveLength(1);
+    expect(reports).toEqual([
+      {
+        status: 'failed',
+        taskId: 'pudgy-all',
+        tokenId: undefined,
+        error: 'Error: OpenSea unavailable',
+      },
+    ]);
+  });
+
+  test('reads OpenSea for a collection it holds nothing of only while a listing is left there', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    gondi.heldTokenIds = [1n];
+    let reads = 0;
+    const read = openSea.mirrorListings.bind(openSea);
+    openSea.mirrorListings = async () => {
+      reads++;
+      return read();
+    };
+    const runner = venueRunnerFor(gondi, openSea, [mirrored()]);
+    await runner.round();
+    gondi.heldTokenIds = [];
+
+    await runner.round();
+    await runner.round();
+    await runner.round();
+
+    expect([reads, openSea.cancelledMirrors]).toEqual([3, ['mirror-100']]);
+  });
+
+  test('lists nothing on OpenSea without the option or without a key', async () => {
+    const gondi = new FakeMarket();
+    const openSea = new FakeMarket();
+    gondi.heldTokenIds = [1n];
+
+    await venueRunnerFor(gondi, openSea, [
+      listingTaskJson({ id: 'pudgy-all', tokenId: undefined }),
+    ]).round();
+    await venueRunnerFor(gondi, undefined, [mirrored()]).round();
+
+    expect(openSea.placedMirrors).toEqual([]);
+  });
+});
+
+describe('Runner with loan offers', () => {
+  const lending = (loanOffer: object = {}) =>
+    listingTaskJson({ id: 'pudgy-all', tokenId: undefined, loanOffer });
+  const THIRTY_DAYS = 30n * 86_400n;
+
+  test('offers a loan against each listed item, a share of its GONDI listing price', async () => {
+    const market = new FakeLendingMarket();
+    market.heldTokenIds = [1n, 2n];
+    const reports: unknown[] = [];
+    const runner = runnerFor(market, [
+      lending({ principalPercent: 70, aprPercent: 8, originationFeePercent: 1, durationDays: 30 }),
+    ]);
+    runner.on('lend', (report) => reports.push(report));
+
+    await runner.round();
+
+    expect(market.lending.placed).toEqual([
+      {
+        scope: { slug: 'pudgypenguins', tokenId: 1n },
+        principal: eth('6.99'),
+        aprBps: 800n,
+        durationSeconds: THIRTY_DAYS,
+        fee: eth('0.0699'),
+        expiration: new Date(NOW.getTime() + 10 * 60_000),
+      },
+      {
+        scope: { slug: 'pudgypenguins', tokenId: 2n },
+        principal: eth('6.99'),
+        aprBps: 800n,
+        durationSeconds: THIRTY_DAYS,
+        fee: eth('0.0699'),
+        expiration: new Date(NOW.getTime() + 10 * 60_000),
+      },
+    ]);
+    expect(reports).toEqual([
+      {
+        status: 'offered',
+        taskId: 'pudgy-all',
+        tokenId: 1n,
+        principal: eth('6.99'),
+        aprBps: 800n,
+        durationSeconds: THIRTY_DAYS,
+        fee: eth('0.0699'),
+      },
+      {
+        status: 'offered',
+        taskId: 'pudgy-all',
+        tokenId: 2n,
+        principal: eth('6.99'),
+        aprBps: 800n,
+        durationSeconds: THIRTY_DAYS,
+        fee: eth('0.0699'),
+      },
+    ]);
+  });
+
+  test('keeps the offer while the listing stands, and reprices with it, hiding the old one', async () => {
+    const market = new FakeLendingMarket();
+    market.heldTokenIds = [1n];
+    const runner = runnerFor(market, [lending()]);
+    await runner.round();
+    await runner.round();
+    market.listingBook = { ...market.listingBook, lowestCompetingAsk: eth('9.5') };
+
+    await runner.round();
+
+    expect([market.lending.placed.map((offer) => offer.principal), market.lending.hidden]).toEqual([
+      [eth('8.99'), eth('8.54')],
+      ['0xloan:1'],
+    ]);
+  });
+
+  test('hides the offer of an item the wallet no longer holds, and then stops reading', async () => {
+    const market = new FakeLendingMarket();
+    market.heldTokenIds = [1n];
+    let reads = 0;
+    const read = market.lending.loanBook.bind(market.lending);
+    market.lending.loanBook = async () => {
+      reads++;
+      return read();
+    };
+    const runner = runnerFor(market, [lending()]);
+    await runner.round();
+    market.heldTokenIds = [];
+
+    await runner.round();
+    await runner.round();
+    await runner.round();
+
+    expect([market.lending.hidden, reads]).toEqual([['0xloan:1'], 3]);
+  });
+
+  test('leaves the offer of an item whose GONDI read fails', async () => {
+    const market = new FakeLendingMarket();
+    market.heldTokenIds = [1n];
+    const runner = runnerFor(market, [lending()]);
+    await runner.round();
+    market.failingTokenIds = [1n];
+
+    await runner.round();
+
+    expect(market.lending.hidden).toEqual([]);
+  });
+
+  test('reports a missing allowance instead of offering', async () => {
+    const market = new FakeLendingMarket();
+    market.heldTokenIds = [1n];
+    market.lending.allowance = eth('1');
+    const reports: unknown[] = [];
+    const runner = runnerFor(market, [lending()]);
+    runner.on('lend', (report) => reports.push(report));
+
+    await runner.round();
+
+    expect([market.lending.placed, reports]).toEqual([
+      [],
+      [{ status: 'waiting', taskId: 'pudgy-all', tokenId: 1n, reason: 'insufficientAllowance' }],
+    ]);
+  });
+
+  test('a failed read is reported and leaves the GONDI listings as they are', async () => {
+    const market = new FakeLendingMarket();
+    market.heldTokenIds = [1n];
+    market.lending.failReads = true;
+    const reports: unknown[] = [];
+    const runner = runnerFor(market, [lending()]);
+    runner.on('lend', (report) => reports.push(report));
+
+    await runner.round();
+
+    expect(market.placedListings).toHaveLength(1);
+    expect(reports).toEqual([
+      {
+        status: 'failed',
+        taskId: 'pudgy-all',
+        tokenId: undefined,
+        error: 'Error: loan offers unavailable',
+      },
+    ]);
+  });
+
+  test('does not draw on exposureLimit', async () => {
+    const market = new FakeLendingMarket();
+    market.heldTokenIds = [1n];
+    const runner = runnerFor(market, [lending(), task('bid')], { exposureLimit: '9' });
+
+    await runner.round();
+
+    expect([market.lending.placed.length, market.ownBids.length]).toEqual([1, 1]);
+  });
+
+  test('cancel-all hides the visible offers', async () => {
+    const market = new FakeLendingMarket();
+    market.lending.offers = [
+      loanOfferOf({ id: '0xloan:7' }),
+      loanOfferOf({ id: '0xloan:8', hidden: true }),
+      loanOfferOf({ id: '0xloan:9', expiration: NOW }),
+    ];
+
+    await runnerFor(market, [lending()]).cancelAll();
+
+    expect(market.lending.hidden).toEqual(['0xloan:7']);
+  });
+
+  test('offers nothing without the option or on a market that does not lend', async () => {
+    const lendingMarket = new FakeLendingMarket();
+    lendingMarket.heldTokenIds = [1n];
+    const plain = new FakeMarket();
+    plain.heldTokenIds = [1n];
+
+    await runnerFor(lendingMarket, [
+      listingTaskJson({ id: 'pudgy-all', tokenId: undefined }),
+    ]).round();
+    await runnerFor(plain, [lending()]).round();
+
+    expect([lendingMarket.lending.placed, plain.placedListings.length]).toEqual([[], 1]);
+  });
+});
+
 describe('Runner on a crossed book', () => {
   test('posts no listing and shows why', async () => {
     const market = new FakeMarket();
@@ -758,5 +1200,312 @@ describe('Runner on a crossed book', () => {
 
     expect(market.placed.map((bid) => bid.price)).toEqual([eth('8.01')]);
     expect(runner.states().get('punks')).toMatchObject({ status: 'bidding' });
+  });
+});
+
+describe('Runner with a bid exit', () => {
+  const exitTask = (bidExit: object = {}) =>
+    listingTaskJson({ id: 'pudgy-all', tokenId: undefined, bidExit });
+  const bought = (tokenId: bigint) => ({
+    slug: 'pudgypenguins',
+    tokenId,
+    side: 'buy' as const,
+    price: eth('9.5'),
+    timestamp: new Date('2029-12-31T00:00:00Z'),
+  });
+  const marketHolding = (tokenIds: bigint[]) => {
+    const market = new FakeMarket();
+    market.heldTokenIds = tokenIds;
+    market.tradeHistory = tokenIds.map(bought);
+    market.exitBid = { id: '0xoffer', venue: 'opensea', netPrice: eth('9.6') };
+    return market;
+  };
+
+  test('sells a held item into the offer over its cost instead of listing it, once', async () => {
+    const market = marketHolding([1n]);
+    const runner = runnerFor(market, [exitTask()], LOSS_LIMITS);
+    const exits: unknown[] = [];
+    runner.on('exit', (report) => exits.push(report));
+
+    await runner.round();
+    await runner.round();
+
+    expect(market.exitSales).toEqual([
+      {
+        scope: { slug: 'pudgypenguins', tokenId: 1n },
+        offer: { id: '0xoffer', venue: 'opensea', netPrice: eth('9.6') },
+        minProceeds: eth('9.5'),
+      },
+    ]);
+    expect(market.placedListings).toEqual([]);
+    expect(exits).toEqual([
+      {
+        status: 'sold',
+        taskId: 'pudgy-all',
+        tokenId: 1n,
+        venue: 'opensea',
+        netPrice: eth('9.6'),
+        reason: 'profit',
+      },
+    ]);
+  });
+
+  test('sells one item a round, and no more than maxPerDay a day', async () => {
+    const market = marketHolding([1n, 2n, 3n]);
+    const runner = runnerFor(market, [exitTask({ maxPerDay: 2 })], LOSS_LIMITS);
+
+    await runner.round();
+    expect(market.exitSales.map((sale) => sale.scope.tokenId)).toEqual([1n]);
+    expect(market.placedListings.map((listing) => listing.scope.tokenId)).toEqual([2n, 3n]);
+    await runner.round();
+    await runner.round();
+
+    expect(market.exitSales.map((sale) => sale.scope.tokenId)).toEqual([1n, 2n]);
+  });
+
+  test('counts a failed sale against maxPerDay', async () => {
+    const market = marketHolding([1n]);
+    market.failExit = true;
+    const runner = runnerFor(market, [exitTask({ maxPerDay: 1 })], LOSS_LIMITS);
+    await runner.round();
+    market.failExit = false;
+
+    await runner.round();
+
+    expect(market.exitSales).toEqual([]);
+  });
+
+  test('tries one sale a round, a failed one included', async () => {
+    const market = marketHolding([1n, 2n]);
+    market.failExit = true;
+    const runner = runnerFor(market, [exitTask()], LOSS_LIMITS);
+    const exits: unknown[] = [];
+    runner.on('exit', (report) => exits.push(report));
+
+    await runner.round();
+
+    expect(exits).toHaveLength(1);
+    expect(market.placedListings.map((listing) => listing.scope.tokenId)).toEqual([1n, 2n]);
+  });
+
+  test('lists an item whose sale failed, and reports why', async () => {
+    const market = marketHolding([1n]);
+    market.failExit = true;
+    const runner = runnerFor(market, [exitTask()], LOSS_LIMITS);
+    const exits: unknown[] = [];
+    runner.on('exit', (report) => exits.push(report));
+
+    await runner.round();
+
+    expect(market.placedListings.map((listing) => listing.scope.tokenId)).toEqual([1n]);
+    expect(exits).toEqual([
+      { status: 'failed', taskId: 'pudgy-all', tokenId: 1n, error: 'Error: reverted' },
+    ]);
+  });
+
+  test('holds while the wallet’s own bid on the collection would buy the item back dearer', async () => {
+    const market = marketHolding([1n]);
+    market.market.bestCompetingBid = eth('8.5');
+    const bid = task('pudgy-buy', { maxPrice: '9.7', pricing: { mode: 'fixed', price: '9.65' } });
+
+    await runnerFor(market, [bid, exitTask()], LOSS_LIMITS).round();
+
+    expect(market.placed.map((placed) => placed.price)).toEqual([eth('9.65')]);
+    expect(market.exitSales).toEqual([]);
+  });
+
+  test.each([
+    ['holds while the collection’s bids can still buy', [1n], 0],
+    ['sells once the collection’s bids hold their maxItems', [1n, 2n], 1],
+  ])('with a stop loss in reach, %s', async (_name, tokenIds, sales) => {
+    const market = marketHolding(tokenIds);
+    market.exitBid = { id: '0xoffer', venue: 'gondi', netPrice: eth('9.45') };
+    const bid = task('pudgy-buy', { maxItems: 2 });
+
+    await runnerFor(market, [bid, exitTask()], LOSS_LIMITS).round();
+
+    expect(market.exitSales).toHaveLength(sales);
+  });
+
+  test('sells at a loss once a bid task without maxItems has bought its quantity', async () => {
+    const market = marketHolding([1n]);
+    market.exitBid = { id: '0xoffer', venue: 'gondi', netPrice: eth('9.45') };
+    const runner = runnerFor(market, [task('pudgy-buy'), exitTask()], LOSS_LIMITS);
+    await runner.round();
+    expect(market.exitSales).toEqual([]);
+    market.ownBids[0].executions = 1;
+    market.ownBids[0].active = false;
+
+    await runner.round();
+
+    expect(runner.states().get('pudgy-buy')).toEqual({ status: 'halted', reason: 'filled' });
+    expect(market.exitSales).toHaveLength(1);
+  });
+
+  test('keeps listing an item bought before lossLimits.since, whose cost is unknown', async () => {
+    const market = marketHolding([1n]);
+    market.tradeHistory = [];
+
+    await runnerFor(market, [exitTask()], LOSS_LIMITS).round();
+
+    expect(market.exitSales).toEqual([]);
+    expect(market.placedListings.map((listing) => listing.scope.tokenId)).toEqual([1n]);
+  });
+});
+
+describe('Runner with a resale bid', () => {
+  const exitTask = listingTaskJson({ id: 'pudgy-all', tokenId: undefined, bidExit: {} });
+  const resaleTask = (id = 'pudgy-buy', overrides: object = {}) =>
+    task(id, { maxPrice: '9.7', maxItems: 1, resaleBid: {}, ...overrides });
+  const marketAtMaxItems = (held = 1) => {
+    const market = new FakeMarket();
+    market.market = { ...market.market, held };
+    market.heldTokenIds = [];
+    market.exitBid = { id: '0xoffer', venue: 'opensea', netPrice: eth('9.6') };
+    return market;
+  };
+  const resaleRunner = (market: FakeMarket, tasks: object[], resaleLimit = '10') =>
+    runnerFor(market, tasks, { ...LOSS_LIMITS, resaleLimit });
+
+  test('keeps one offer at a price the bid exit resells at a profit, apart from exposureLimit', async () => {
+    const market = marketAtMaxItems();
+    const runner = resaleRunner(market, [resaleTask(), exitTask]);
+    const reports: RoundReport[] = [];
+    runner.on('round', (report) => reports.push(report));
+
+    await runner.round();
+
+    expect(market.placed.map(({ price, quantity }) => ({ price, quantity }))).toEqual([
+      { price: eth('9.41'), quantity: 1 },
+    ]);
+    expect(runner.states().get('pudgy-buy')).toMatchObject({
+      status: 'bidding',
+      price: eth('9.41'),
+      resale: 'maxItemsHeld',
+    });
+    expect(reports[0].committed).toBe(0n);
+    expect(reports[0].tasks[0].resaleCommitment).toBe(eth('9.41'));
+  });
+
+  test.each([
+    ['when the price does not fit in resaleLimit', marketAtMaxItems(), '9'],
+    ['while an item an earlier offer bought is not sold yet', marketAtMaxItems(2), '10'],
+  ])('waits %s', async (_name, market, resaleLimit) => {
+    const runner = resaleRunner(market, [resaleTask(), exitTask], resaleLimit);
+
+    await runner.round();
+
+    expect(market.placed).toEqual([]);
+    expect(runner.states().get('pudgy-buy')).toEqual({ status: 'waiting', reason: 'maxItemsHeld' });
+  });
+
+  test('places no other offer while the item one bought is unsold, under maxHeldValue too', async () => {
+    const market = marketAtMaxItems();
+    const bid = resaleTask('pudgy-buy', { maxItems: undefined, maxHeldValue: '15' });
+    const runner = resaleRunner(market, [bid, exitTask]);
+    await runner.round();
+    market.ownBids[0].executions = 1;
+    market.ownBids[0].active = false;
+    market.market = { ...market.market, held: 2 };
+
+    await runner.round();
+    expect(market.placed).toHaveLength(1);
+    expect(runner.states().get('pudgy-buy')).toEqual({ status: 'waiting', reason: 'maxHeldValue' });
+
+    market.market = { ...market.market, held: 1 };
+    await runner.round();
+    expect(market.placed).toHaveLength(2);
+  });
+
+  test('places no offer on the collection from another task while the item is unsold', async () => {
+    const gondi = marketAtMaxItems();
+    const openSea = marketAtMaxItems();
+    const valueCapped = { maxItems: 10, maxHeldValue: '15' };
+    const runner = new Runner(
+      new VenueMarket(gondi, { gondi, opensea: openSea }),
+      tasksFileOf(
+        [
+          resaleTask('first', valueCapped),
+          resaleTask('second', { ...valueCapped, venue: 'opensea' }),
+          exitTask,
+        ],
+        { ...LOSS_LIMITS, resaleLimit: '10' },
+      ),
+      NOW,
+      () => NOW,
+    );
+    const holding = (held: number) => {
+      gondi.market = { ...gondi.market, held };
+      openSea.market = { ...openSea.market, held };
+    };
+    await runner.round();
+    expect([gondi.placed.length, openSea.placed.length]).toEqual([1, 0]);
+    gondi.ownBids[0].executions = 1;
+    gondi.ownBids[0].active = false;
+    holding(2);
+
+    await runner.round();
+    expect([gondi.placed.length, openSea.placed.length]).toEqual([1, 0]);
+
+    holding(1);
+    await runner.round();
+    expect(gondi.placed.length + openSea.placed.length).toBe(2);
+  });
+
+  test('keeps one offer per collection', async () => {
+    const market = marketAtMaxItems();
+
+    await resaleRunner(market, [resaleTask('first'), resaleTask('second'), exitTask]).round();
+
+    expect(market.placed).toHaveLength(1);
+  });
+
+  test('reads the offer once a round for the resale bid and the bid exit together', async () => {
+    const market = marketAtMaxItems();
+    const reads = spyOn(market, 'exitOffer');
+    market.heldTokenIds = [7n];
+
+    await resaleRunner(market, [resaleTask(), exitTask]).round();
+
+    expect(reads).toHaveBeenCalledTimes(1);
+  });
+
+  test('withdraws the resale offer once the task can bid as usual again', async () => {
+    const market = marketAtMaxItems();
+    const runner = resaleRunner(market, [resaleTask(), exitTask]);
+    await runner.round();
+    market.market = { ...market.market, held: 0 };
+
+    await runner.round();
+
+    expect(market.placed.map((placed) => placed.price)).toEqual([eth('9.41'), eth('8.01')]);
+    expect(market.cancelled).toHaveLength(1);
+    expect(market.ownBids.map((bid) => bid.price)).toEqual([eth('8.01')]);
+    expect(runner.states().get('pudgy-buy')).not.toHaveProperty('resale');
+  });
+
+  test('keeps no resale offer once bidExit has tried its sales for the day', async () => {
+    const market = marketAtMaxItems();
+    market.heldTokenIds = [7n];
+    market.failExit = true;
+    market.tradeHistory = [
+      {
+        slug: 'pudgypenguins',
+        tokenId: 7n,
+        side: 'buy',
+        price: eth('9'),
+        timestamp: new Date('2029-12-31T00:00:00Z'),
+      },
+    ];
+    const exit = listingTaskJson({
+      id: 'pudgy-all',
+      tokenId: undefined,
+      bidExit: { maxPerDay: 1 },
+    });
+    const runner = resaleRunner(market, [exit, resaleTask()]);
+
+    await runner.round();
+
+    expect(market.placed).toEqual([]);
   });
 });

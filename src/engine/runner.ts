@@ -1,36 +1,80 @@
 import { EventEmitter } from 'node:events';
 
+import { decideExit, resalePrice } from './exit';
 import {
   decideInventoryItem,
   decideListing,
   isCrossed,
   type ListingDecision,
   type ListingWaitReason,
+  refreshMarginMs,
 } from './listing';
-import type { BidScope, Fill, ListingScope, Market, OwnBid, OwnListing } from './market';
+import { decideLoanOffer } from './loan';
+import type {
+  BidScope,
+  BidSnapshot,
+  ExitOffer,
+  Fill,
+  ListingScope,
+  LoanBook,
+  Market,
+  MirrorListing,
+  OwnBid,
+  OwnListing,
+  Venue,
+} from './market';
+import { decideMirror } from './mirror';
 import {
+  dayStart,
   ledgerOf,
   type LossReport,
   lossReport,
   pnlOf,
   type PnlReport,
+  type Position,
   tradedCollections,
   valuedCollections,
 } from './pnl';
-import { type HaltReason, reconcile, remaining, type WaitReason } from './reconcile';
-import type { BidTask, ListingTask, LossLimits, Task, TasksFile } from './task';
+import {
+  type Decision,
+  type HaltReason,
+  isResaleWait,
+  reconcile,
+  remaining,
+  type ResaleWaitReason,
+  type WaitReason,
+} from './reconcile';
+import {
+  type BidTask,
+  type ListingTask,
+  type LossLimits,
+  resaleExitOf,
+  type Task,
+  type TasksFile,
+} from './task';
 import { wrapAmount } from './wrap';
 
 /** What one listed item shows. */
 export type ListingItemState =
   | { status: 'listing'; listingId: number; price: bigint }
   | { status: 'waiting'; reason: ListingWaitReason }
+  /** Sold into a bid on `venue` this round, for `netPrice` before gas (`bidExit`). */
+  | { status: 'sold'; venue: Venue; netPrice: bigint }
   | { status: 'failing'; error: string };
 
 export type TaskState =
   | { status: 'starting' }
-  /** `bidId` and `price` are the top offer's; `offers` counts every live one. */
-  | { status: 'bidding'; bidId: string; price: bigint; offers: number }
+  /**
+   * `bidId` and `price` are the top offer's; `offers` counts every live one. `resale` names the
+   * cap the task's one `resaleBid` offer stands in for, when that is what it keeps up.
+   */
+  | {
+      status: 'bidding';
+      bidId: string;
+      price: bigint;
+      offers: number;
+      resale?: ResaleWaitReason;
+    }
   | { status: 'listing'; listingId: number; price: bigint }
   | { status: 'listingInventory'; items: { tokenId: bigint; state: ListingItemState }[] }
   | { status: 'waiting'; reason: WaitReason | ListingWaitReason }
@@ -55,6 +99,8 @@ type TaskRun<RunTask extends Task = Task> = {
   referenceFloor: bigint | null;
   /** What the task's live bids commit: see `commitmentOf`. */
   commitment: bigint;
+  /** What its `resaleBid` offer commits against `resaleLimit` instead; `0n` without one. */
+  resaleCommitment: bigint;
   /** The floor and the items held as the task's latest bid snapshot read them; `null` before one. */
   floorPrice: bigint | null;
   held: number | null;
@@ -73,11 +119,57 @@ export type WrapReport =
   | { status: 'wrapped'; amount: bigint }
   | { status: 'failed'; error: string };
 
+/**
+ * What an `bidExit` did: sold `tokenId` into an offer for `netPrice` before gas, or failed
+ * with `error`, on the item or, with no `tokenId`, on reading the offer.
+ */
+export type ExitReport =
+  | {
+      status: 'sold';
+      taskId: string;
+      tokenId: bigint;
+      venue: Venue;
+      netPrice: bigint;
+      reason: 'profit' | 'stopLoss';
+    }
+  | { status: 'failed'; taskId: string; tokenId: bigint | undefined; error: string };
+
+/**
+ * What an `openSeaListing` did on OpenSea: listed `tokenId` at `price`, cancelled listings of
+ * `tokenId`, or failed with `error`, on the item or, with no `tokenId`, on reading the listings.
+ */
+export type MirrorReport =
+  | { status: 'listed'; taskId: string; tokenId: bigint; price: bigint }
+  | { status: 'cancelled'; taskId: string; tokenId: bigint; count: number }
+  | { status: 'failed'; taskId: string; tokenId: bigint | undefined; error: string };
+
+/** What a listing task's `loanOffer` did for one item, or why it could not. */
+export type LendReport =
+  | {
+      status: 'offered';
+      taskId: string;
+      tokenId: bigint;
+      principal: bigint;
+      aprBps: bigint;
+      durationSeconds: bigint;
+      fee: bigint;
+    }
+  | { status: 'hidden'; taskId: string; tokenId: bigint; count: number }
+  | {
+      status: 'waiting';
+      taskId: string;
+      tokenId: bigint;
+      reason: 'insufficientBalance' | 'insufficientAllowance';
+    }
+  | { status: 'failed'; taskId: string; tokenId: bigint | undefined; error: string };
+
 /** What a round saw and did, emitted as `round` once every task has advanced. */
 export type RoundReport = {
   finishedAt: Date;
   durationMs: number;
   exposureLimit: bigint;
+  /** What every live bid commits against `exposureLimit`, as `exposureOf` counts it. */
+  committed: bigint;
   lossLimits: LossLimits | undefined;
   /** `undefined` without `lossLimits`. */
   loss: LossReport | undefined;
@@ -93,7 +185,16 @@ type RunnerEvents = {
   loss: [report: LossReport];
   round: [report: RoundReport];
   wrap: [report: WrapReport];
+  exit: [report: ExitReport];
+  mirror: [report: MirrorReport];
+  lend: [report: LendReport];
 };
+
+/** The best other wallet's bid on a collection and the gas price, as a round reads them. */
+type ExitOfferRead = { offer: ExitOffer | null; gasPrice: bigint };
+
+/** What a `bidExit` reads once a round, before deciding on each held item. */
+type ExitMarket = ExitOfferRead & { pendingTransaction: boolean };
 
 /** How long a measured loss stands in for a read that fails, before bidding stops. */
 const LOSS_READ_GRACE_MS = 2 * 60_000;
@@ -105,7 +206,9 @@ const fillKey = (fill: Fill) =>
   `${fill.slug}#${fill.tokenId}#${fill.side}#${fill.timestamp.getTime()}#${fill.price}`;
 
 const scopeOf = (task: BidTask): BidScope => ({
-  kind: 'collection',
+  ...(task.kind === 'traitBid'
+    ? { kind: 'trait' as const, trait: task.trait }
+    : { kind: 'collection' as const }),
   slug: task.collection,
   venue: task.venue,
   ...(task.pricing.mode === 'level' && { levels: task.pricing.level }),
@@ -147,6 +250,50 @@ const commitmentOf = (bids: OwnBid[]) => {
   return highestPrice * BigInt(mostRemaining);
 };
 
+/**
+ * The tasks that bid one collection's WETH together: collection bids of the same collection share
+ * a key, every other task has its own.
+ */
+const exposureKey = (task: Task) =>
+  task.kind === 'collectionBid' ? `collection:${task.collection}` : `task:${task.id}`;
+
+/**
+ * Whether `run` and `other` share WETH against `exposureLimit`: collection bids of one collection
+ * on different venues. Each holds the same WETH, and `maxItems` counts what the wallet holds of the
+ * collection, so a fill on either venue stops both on the next round. Bids on one venue still add
+ * up, since they can fill one after another before the next round counts the items.
+ */
+const sharesWeth = (run: TaskRun, other: TaskRun) =>
+  exposureKey(run.task) === exposureKey(other.task) && venueOf(run.task) !== venueOf(other.task);
+
+const venueOf = (task: Task) => (task.kind === 'listing' ? undefined : task.venue);
+
+/**
+ * What `runs` commit together against `exposureLimit`: per collection, the most any one venue's
+ * tasks commit, the venues sharing WETH (see `sharesWeth`), summed over the collections.
+ */
+const exposureOf = (runs: TaskRun[]) => {
+  const collections = new Map<string, Map<string | undefined, bigint>>();
+  for (const run of runs) {
+    const venues = collections.get(exposureKey(run.task)) ?? new Map<string | undefined, bigint>();
+    const venue = venueOf(run.task);
+    venues.set(venue, (venues.get(venue) ?? 0n) + run.commitment);
+    collections.set(exposureKey(run.task), venues);
+  }
+  return [...collections.values()].reduce(
+    (total, venues) =>
+      total + [...venues.values()].reduce((most, sum) => (sum > most ? sum : most), 0n),
+    0n,
+  );
+};
+
+/** The waits that last until the wallet holds less or the loss window rolls over, not a round. */
+const HOLDING_CAPS = new Set<WaitReason | ListingWaitReason>([
+  'maxItemsHeld',
+  'maxHeldValue',
+  'lossLimit',
+]);
+
 const isBidRun = (run: TaskRun): run is TaskRun<BidTask> => run.task.kind !== 'listing';
 const isListingRun = (run: TaskRun): run is TaskRun<ListingTask> => run.task.kind === 'listing';
 
@@ -166,6 +313,20 @@ const isListingRun = (run: TaskRun): run is TaskRun<ListingTask> => run.task.kin
  * A failing round leaves the task's bid as it is and is retried on the next round; nothing is
  * placed from a snapshot that could not be read whole. Listing tasks run in the same rounds but
  * never cancel and never count against the exposure limit, which only bids draw on.
+ *
+ * A listing task with `bidExit` first offers each held item to `decideExit`, at most one sale a
+ * round, and lists only the items it did not sell; each sale or failed one is emitted as `exit`.
+ * What each item cost comes from the fills `lossLimits` reads.
+ *
+ * A listing task with `openSeaListing` then mirrors each item's GONDI listing on OpenSea at a
+ * markup (`decideMirror`), and cancels the OpenSea listings of items it no longer lists; each
+ * listing, cancel or failure is emitted as `mirror`, and none of them changes what the item shows.
+ *
+ * A listing task with `loanOffer`, on a market that lends, then keeps one single-loan offer
+ * against each item it lists, priced off the item's GONDI listing (`decideLoanOffer`), so a buyer
+ * can buy it now and pay later, and hides the offers of items it no longer lists; each offer,
+ * hide, wait or failure is emitted as `lend`. Loan offers draw on the wallet's WETH but not on
+ * `exposureLimit`: a loan only starts as the item it lends against is bought from the wallet.
  */
 export class Runner extends EventEmitter<RunnerEvents> {
   private readonly runs: TaskRun[];
@@ -179,6 +340,47 @@ export class Runner extends EventEmitter<RunnerEvents> {
   private lastMeasured:
     | { loss: Extract<LossReport, { status: 'measured' }>; pnl: PnlReport; at: Date }
     | undefined;
+  /** The items the fills read so far say the wallet bought and still holds, with their cost. */
+  private positions: Position[] = [];
+  /**
+   * How many sales into offers each task tried, by task id and UTC day, failed ones included so a
+   * sale that keeps reverting cannot spend gas all day; in memory only.
+   */
+  private readonly exitsByDay = new Map<string, number>();
+  /**
+   * The items this run sold into offers, by `slug#tokenId`: the holdings index trails a sale by up
+   * to a minute, and such an item must not be sold or listed again.
+   */
+  private readonly exited = new Set<string>();
+  /**
+   * The `openSeaListing` tasks whose latest read found OpenSea listings, or that placed one since: a
+   * task that holds nothing
+   * reads OpenSea again only while one may be left to cancel, which spares OpenSea's rate limit.
+   */
+  private readonly mirrored = new Set<string>();
+  /**
+   * The `loanOffer` tasks whose latest read found visible loan offers, or that signed one since: a
+   * task that holds nothing reads its offers again only while one may be left to hide.
+   */
+  private readonly lending = new Set<string>();
+  /**
+   * When this run first found each listed item held, by `taskId#tokenId`: where a listing's
+   * `decay` starts. In memory only, so a restart lists at the full price again.
+   */
+  private readonly listedSince = new Map<string, Date>();
+  /**
+   * Each collection's `ExitOfferRead` this round, by slug, so a `resaleBid` and the `bidExit` that
+   * sells what it buys read the offer once between them; emptied at the start of every round.
+   */
+  private readonly exitOfferReads = new Map<string, Promise<ExitOfferRead>>();
+  /**
+   * Per collection, the task that last kept a `resaleBid` offer up there and what the wallet held,
+   * as that task's snapshot counts it, when it did: that task holding more since means the offer
+   * filled and its item is not sold yet, so no task on the collection puts another one up. Dropped
+   * once that task bids as usual; in memory only, so after a restart only the `maxItems` check
+   * stands in for it.
+   */
+  private readonly resaleHeldAt = new Map<string, { taskId: string; held: number }>();
 
   constructor(
     private readonly market: Market,
@@ -192,6 +394,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
       state: task.enabled ? { status: 'starting' } : { status: 'halted', reason: 'disabled' },
       referenceFloor: null,
       commitment: 0n,
+      resaleCommitment: 0n,
       floorPrice: null,
       held: null,
       bestCompetingBid: null,
@@ -232,7 +435,11 @@ export class Runner extends EventEmitter<RunnerEvents> {
    */
   async round() {
     const startedAt = this.now();
+    this.exitOfferReads.clear();
     const { loss, pnl } = await this.reportLoss();
+    if (this.file.lossLimits) {
+      this.positions = ledgerOf([...this.fillsRead.values()], this.file.lossLimits.since).positions;
+    }
     await this.topUpWeth();
     for (const run of this.runs) {
       if (isBidRun(run) && !run.task.enabled) await this.countLeftBids(run);
@@ -245,6 +452,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
       finishedAt,
       durationMs: finishedAt.getTime() - startedAt.getTime(),
       exposureLimit: this.file.exposureLimit,
+      committed: exposureOf(this.runs),
       lossLimits: this.file.lossLimits,
       loss,
       fills: [...this.fillsRead.values()],
@@ -265,6 +473,11 @@ export class Runner extends EventEmitter<RunnerEvents> {
     const failures: string[] = [];
     for (const run of this.runs) {
       if (!isBidRun(run)) {
+        try {
+          if (isListingRun(run)) await this.hideLoanOffers(run.task);
+        } catch (error) {
+          failures.push(`${run.task.id}: ${String(error)}`);
+        }
         this.update(run, { status: 'halted', reason: 'cancelledAll' });
         continue;
       }
@@ -273,6 +486,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
         const active = snapshot.ownBids.filter((bid) => bid.active);
         if (active.length > 0) await this.market.cancelBids(active);
         run.commitment = 0n;
+        run.resaleCommitment = 0n;
         run.orders = [];
         this.update(run, { status: 'halted', reason: 'cancelledAll' });
       } catch (error) {
@@ -437,17 +651,30 @@ export class Runner extends EventEmitter<RunnerEvents> {
     run.floorPrice = snapshot.floorPrice;
     run.held = snapshot.held;
     run.bestCompetingBid = snapshot.bestCompetingBid;
-    const decision = reconcile({
+    const input = {
       task: run.task,
       snapshot,
       now: this.now(),
+      pollSeconds: this.file.pollSeconds,
       referenceFloor: run.referenceFloor,
       exposureAvailable: this.file.exposureLimit - this.committedByOthers(run),
       lossLimitReached,
-    });
+    };
+    let decision: Decision = reconcile({ ...input, resalePrice: null });
+    if (decision.type === 'wait' && isResaleWait(decision.reason) && run.task.resaleBid) {
+      decision = reconcile({ ...input, resalePrice: await this.resalePriceOf(run, snapshot) });
+    }
+    const resaleAt = decision.type === 'resale' ? decision.price : null;
+    const slug = run.task.collection;
+    if (decision.type === 'resale') {
+      this.resaleHeldAt.set(slug, { taskId: run.task.id, held: snapshot.held });
+    }
+    if (decision.type === 'bid' && this.resaleHeldAt.get(slug)?.taskId === run.task.id) {
+      this.resaleHeldAt.delete(slug);
+    }
     const cancelled = new Set(decision.cancel.map((bid) => bid.id));
     const leftUp = snapshot.ownBids.filter((bid) => bid.active && !cancelled.has(bid.id));
-    const placements = decision.type === 'bid' ? decision.place : [];
+    const placements = decision.type === 'bid' || decision.type === 'resale' ? decision.place : [];
     for (const { price, quantity } of placements) {
       leftUp.push(
         await this.market.placeBid({
@@ -457,17 +684,18 @@ export class Runner extends EventEmitter<RunnerEvents> {
           expiration: new Date(this.now().getTime() + run.task.expirationMinutes * 60_000),
         }),
       );
-      this.book(run, leftUp);
+      this.book(run, leftUp, resaleAt);
     }
     if (decision.cancel.length > 0) await this.market.cancelBids(decision.cancel);
-    this.book(run, leftUp);
-    if (decision.type === 'bid' && leftUp.length > 0) {
+    this.book(run, leftUp, resaleAt);
+    if ((decision.type === 'bid' || decision.type === 'resale') && leftUp.length > 0) {
       const top = leftUp.reduce((best, bid) => (bid.price > best.price ? bid : best));
       this.update(run, {
         status: 'bidding',
         bidId: top.id,
         price: top.price,
         offers: leftUp.length,
+        ...(decision.type === 'resale' && { resale: decision.reason }),
       });
     }
     if (decision.type === 'wait') this.update(run, { status: 'waiting', reason: decision.reason });
@@ -477,11 +705,81 @@ export class Runner extends EventEmitter<RunnerEvents> {
   /**
    * Books `bids`, the task's bids still live once its decision is carried out, as its orders and
    * its commitment: a bid the marketplace would not cancel yet stays up through a `wait` or beside
-   * a kept bid, and still counts against `exposureLimit` for every other task.
+   * a kept bid, and still counts against `exposureLimit` for every other task. The bids at
+   * `resaleAt`, the price of a `resale` decision, count against `resaleLimit` instead.
    */
-  private book(run: TaskRun, bids: OwnBid[]) {
-    run.commitment = commitmentOf(bids);
+  private book(run: TaskRun, bids: OwnBid[], resaleAt: bigint | null = null) {
+    const isResale = (bid: OwnBid) => resaleAt !== null && bid.price === resaleAt;
+    run.commitment = commitmentOf(bids.filter((bid) => !isResale(bid)));
+    run.resaleCommitment = commitmentOf(bids.filter(isResale));
     run.orders = bids.map(bidOrder);
+  }
+
+  /**
+   * The price of the task's `resaleBid` offer this round, or `null` when it keeps none: without a
+   * `resaleLimit` or an enabled listing with `bidExit` on the collection (the desktop app drops
+   * every `bidExit`), once that `bidExit` has tried its `maxPerDay` sales today, while the wallet
+   * holds more than when a task last kept one up on the collection (`resaleHeldAt`) or more than `maxItems` (an
+   * item an earlier offer bought is not sold yet), while another task
+   * keeps one on the collection, when the offer or the gas cannot be read, or when the price does
+   * not fit in what `resaleLimit` has left.
+   */
+  private async resalePriceOf(run: TaskRun<BidTask>, snapshot: BidSnapshot) {
+    const { task } = run;
+    const exitTask = resaleExitOf(this.file, task.collection);
+    const exit = exitTask?.bidExit;
+    if (!task.resaleBid || this.file.resaleLimit === undefined || !exitTask || !exit) return null;
+    const dayKey = `${exitTask.id}#${dayStart(this.now()).toISOString()}`;
+    const others = this.runs.filter((other) => other !== run);
+    if (
+      this.resaleItemUnsold(task.collection) ||
+      (this.exitsByDay.get(dayKey) ?? 0) >= exit.maxPerDay ||
+      (task.maxItems !== undefined && snapshot.held > task.maxItems) ||
+      others.some(
+        (other) => other.task.collection === task.collection && other.resaleCommitment > 0n,
+      )
+    ) {
+      return null;
+    }
+    let read: ExitOfferRead;
+    try {
+      read = await this.readExitOffer(task.collection);
+    } catch {
+      return null;
+    }
+    const price = resalePrice({
+      ...read,
+      maxGasGwei: exit.maxGasGwei,
+      marginPercent: task.resaleBid.marginPercent,
+      floorPrice: snapshot.floorPrice,
+      maxPrice: task.maxPrice,
+      priceStep: snapshot.priceStep,
+    });
+    const room =
+      this.file.resaleLimit - others.reduce((total, other) => total + other.resaleCommitment, 0n);
+    return price !== null && price <= room ? price : null;
+  }
+
+  /**
+   * Whether the task that last kept a resale offer up on the collection holds more than it did
+   * then, by its latest snapshot (see `resaleHeldAt`).
+   */
+  private resaleItemUnsold(slug: string) {
+    const heldAt = this.resaleHeldAt.get(slug);
+    const setter = heldAt && this.runs.find((run) => run.task.id === heldAt.taskId);
+    return !!heldAt && !!setter && (setter.held ?? 0) > heldAt.held;
+  }
+
+  /** The collection's `ExitOfferRead`, read once a round (see `exitOfferReads`). */
+  private readExitOffer(slug: string) {
+    const cached = this.exitOfferReads.get(slug);
+    if (cached) return cached;
+    const read = Promise.all([this.market.exitOffer(slug), this.market.gasPrice()]).then(
+      ([offer, gasPrice]) => ({ offer, gasPrice }),
+    );
+    read.catch(() => this.exitOfferReads.delete(slug));
+    this.exitOfferReads.set(slug, read);
+    return read;
   }
 
   private async advanceListing(run: TaskRun<ListingTask>, tokenId: bigint) {
@@ -490,7 +788,14 @@ export class Runner extends EventEmitter<RunnerEvents> {
     const itemListing = await this.market.itemListing(scope, this.startedAt);
     run.lowestCompetingAsk = listingMarket.lowestCompetingAsk;
     const snapshot = { ...listingMarket, ...itemListing };
-    const decision = decideListing({ task: run.task, snapshot, now: this.now() });
+    const now = this.now();
+    const decision = decideListing({
+      task: run.task,
+      snapshot,
+      now,
+      pollSeconds: this.file.pollSeconds,
+      listedSince: this.listedSinceOf(run.task, tokenId, now, snapshot.owned),
+    });
     if (decision.type === 'halt') {
       run.orders = [];
       this.update(run, { status: 'halted', reason: decision.reason });
@@ -516,25 +821,254 @@ export class Runner extends EventEmitter<RunnerEvents> {
       tokenIds.map((tokenId) => this.market.itemListing({ slug, tokenId }, this.startedAt)),
     );
     run.lowestCompetingAsk = listingMarket.lowestCompetingAsk;
+    const heldKeys = new Set(tokenIds.map((tokenId) => `${run.task.id}#${tokenId}`));
+    for (const key of this.listedSince.keys()) {
+      if (key.startsWith(`${run.task.id}#`) && !heldKeys.has(key)) this.listedSince.delete(key);
+    }
     const items: { tokenId: bigint; state: ListingItemState }[] = [];
     const orders: LiveOrder[] = [];
+    const held = tokenIds.filter((tokenId) => !this.exited.has(`${slug}#${tokenId}`));
+    const mirrors =
+      held.length > 0 || this.mirrored.has(run.task.id)
+        ? await this.readMirrors(run.task)
+        : undefined;
+    const loanBook =
+      held.length > 0 || this.lending.has(run.task.id)
+        ? await this.readLoanBook(run.task)
+        : undefined;
+    const gondiListings = new Map<bigint, OwnListing[]>();
+    const unread = new Set<bigint>();
+    let exitMarket = held.length > 0 ? await this.readExitMarket(run.task) : undefined;
     for (const [index, tokenId] of tokenIds.entries()) {
       const itemListing = itemListings[index];
       const scope = { slug, tokenId };
+      if (!held.includes(tokenId)) continue;
+      const exited = exitMarket && (await this.exitItem(run.task, scope, exitMarket, held.length));
+      if (exited) exitMarket = undefined;
+      if (exited?.status === 'sold') {
+        const { venue, netPrice } = exited.offer;
+        items.push({ tokenId, state: { status: 'sold', venue, netPrice } });
+        continue;
+      }
+      if (itemListing.status === 'rejected') unread.add(tokenId);
       try {
         if (itemListing.status === 'rejected') throw itemListing.reason;
         const snapshot = { ...listingMarket, ...itemListing.value };
-        const decision = decideInventoryItem({ task: run.task, snapshot, now: this.now() });
+        const now = this.now();
+        const decision = decideInventoryItem({
+          task: run.task,
+          snapshot,
+          now,
+          pollSeconds: this.file.pollSeconds,
+          listedSince: this.listedSinceOf(run.task, tokenId, now, snapshot.owned),
+        });
         if (!decision) continue;
+        gondiListings.set(tokenId, snapshot.ownListings);
         const { state, listing } = await this.carryOutListing(run.task, scope, decision);
         items.push({ tokenId, state });
         if (listing) orders.push(listingOrder(listing, tokenId));
+        if (listing) gondiListings.set(tokenId, [...snapshot.ownListings, listing]);
       } catch (error) {
         items.push({ tokenId, state: { status: 'failing', error: String(error) } });
       }
     }
+    if (mirrors) await this.mirrorItems(run.task, mirrors, gondiListings, unread);
+    if (loanBook) await this.lendItems(run.task, loanBook, gondiListings, unread);
     run.orders = orders;
     this.update(run, { status: 'listingInventory', items });
+  }
+
+  /**
+   * When this run first found `tokenId` held for `task`, noting `now` the first time. An item not
+   * held has no clock, so one that leaves the wallet and comes back starts again.
+   */
+  private listedSinceOf(task: ListingTask, tokenId: bigint, now: Date, owned: boolean) {
+    const key = `${task.id}#${tokenId}`;
+    if (!owned) {
+      this.listedSince.delete(key);
+      return now;
+    }
+    const since = this.listedSince.get(key) ?? now;
+    this.listedSince.set(key, since);
+    return since;
+  }
+
+  /**
+   * With `openSeaListing` and an OpenSea key, the wallet's OpenSea listings of the collection, read
+   * once for the round, and noted in `mirrored`; `undefined` otherwise, or when the read fails, which is reported as
+   * `mirror` and leaves the OpenSea listings as they are this round.
+   */
+  private async readMirrors(task: ListingTask): Promise<MirrorListing[] | undefined> {
+    if (!task.openSeaListing || !this.market.mirror) return undefined;
+    try {
+      const mirrors = await this.market.mirror.mirrorListings(task.collection);
+      if (mirrors.length > 0) this.mirrored.add(task.id);
+      else this.mirrored.delete(task.id);
+      return mirrors;
+    } catch (error) {
+      this.emit('mirror', {
+        status: 'failed',
+        taskId: task.id,
+        tokenId: undefined,
+        error: String(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Carries out `decideMirror` for every item the round listed or that has an OpenSea listing,
+   * cancelling before placing; an item whose GONDI read failed is left as it is. `gondiListings`
+   * holds each listed item's GONDI listings, so an item missing from it (sold, moved, or no longer
+   * held) has its OpenSea listings cancelled. Each item fails on its own, reported as `mirror`.
+   */
+  private async mirrorItems(
+    task: ListingTask,
+    mirrors: MirrorListing[],
+    gondiListings: Map<bigint, OwnListing[]>,
+    unread: Set<bigint>,
+  ) {
+    const mirror = this.market.mirror;
+    if (!task.openSeaListing || !mirror) return;
+    const { markupPercent, expirationMinutes } = task.openSeaListing;
+    const tokenIds = new Set([...gondiListings.keys(), ...mirrors.map((item) => item.tokenId)]);
+    for (const tokenId of tokenIds) {
+      if (unread.has(tokenId)) continue;
+      const now = this.now();
+      const decision = decideMirror({
+        markupPercent,
+        gondiListings: gondiListings.get(tokenId) ?? [],
+        mirrors: mirrors.filter((item) => item.tokenId === tokenId),
+        priceStep: mirror.priceStep,
+        refreshMarginMs: refreshMarginMs(expirationMinutes, this.file.pollSeconds),
+        now,
+      });
+      try {
+        if (decision.cancel.length > 0) {
+          await mirror.cancelMirrorListings(decision.cancel);
+          this.emit('mirror', {
+            status: 'cancelled',
+            taskId: task.id,
+            tokenId,
+            count: decision.cancel.length,
+          });
+        }
+        if (decision.place !== null) {
+          await mirror.placeMirrorListing({
+            scope: { slug: task.collection, tokenId },
+            price: decision.place,
+            expiration: new Date(now.getTime() + expirationMinutes * 60_000),
+          });
+          this.mirrored.add(task.id);
+          this.emit('mirror', {
+            status: 'listed',
+            taskId: task.id,
+            tokenId,
+            price: decision.place,
+          });
+        }
+      } catch (error) {
+        this.emit('mirror', { status: 'failed', taskId: task.id, tokenId, error: String(error) });
+      }
+    }
+  }
+
+  /**
+   * With `loanOffer` on a market that lends, the wallet's loan offers on the collection and its
+   * WETH, read once for the round; `undefined` otherwise, or when the read fails, which is reported
+   * as `lend` and leaves the offers as they are this round.
+   */
+  private async readLoanBook(task: ListingTask): Promise<LoanBook | undefined> {
+    if (!task.loanOffer || !this.market.loans) return undefined;
+    try {
+      const book = await this.market.loans.loanBook(task.collection);
+      if (book.offers.some((offer) => !offer.hidden)) this.lending.add(task.id);
+      else this.lending.delete(task.id);
+      return book;
+    } catch (error) {
+      this.emit('lend', {
+        status: 'failed',
+        taskId: task.id,
+        tokenId: undefined,
+        error: String(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Carries out `decideLoanOffer` for every item the round listed or that has a loan offer, hiding
+   * after signing, as a bid is placed before the old one is cancelled; an item whose GONDI read
+   * failed is left as it is. An item missing from `gondiListings` (sold, moved, or no longer held)
+   * has its visible offers hidden. Each item fails on its own, reported as `lend`.
+   */
+  private async lendItems(
+    task: ListingTask,
+    book: LoanBook,
+    gondiListings: Map<bigint, OwnListing[]>,
+    unread: Set<bigint>,
+  ) {
+    const loans = this.market.loans;
+    if (!task.loanOffer || !loans) return;
+    const { expirationMinutes } = task.loanOffer;
+    const tokenIds = new Set([
+      ...gondiListings.keys(),
+      ...book.offers.map((offer) => offer.tokenId),
+    ]);
+    for (const tokenId of tokenIds) {
+      if (unread.has(tokenId)) continue;
+      const now = this.now();
+      const decision = decideLoanOffer({
+        terms: task.loanOffer,
+        minPrice: task.minPrice,
+        gondiListings: gondiListings.get(tokenId) ?? [],
+        offers: book.offers.filter((offer) => offer.tokenId === tokenId),
+        balance: book.balance,
+        allowance: book.allowance,
+        refreshMarginMs: refreshMarginMs(expirationMinutes, this.file.pollSeconds),
+        now,
+      });
+      try {
+        if (decision.type === 'place') {
+          await loans.placeLoanOffer({
+            scope: { slug: task.collection, tokenId },
+            ...decision.terms,
+            expiration: new Date(now.getTime() + expirationMinutes * 60_000),
+          });
+          this.lending.add(task.id);
+          this.emit('lend', { status: 'offered', taskId: task.id, tokenId, ...decision.terms });
+        }
+        if (decision.type === 'wait' && decision.reason !== 'notListed') {
+          this.emit('lend', {
+            status: 'waiting',
+            taskId: task.id,
+            tokenId,
+            reason: decision.reason,
+          });
+        }
+        if (decision.hide.length > 0) {
+          await loans.hideLoanOffers(decision.hide);
+          this.emit('lend', {
+            status: 'hidden',
+            taskId: task.id,
+            tokenId,
+            count: decision.hide.length,
+          });
+        }
+      } catch (error) {
+        this.emit('lend', { status: 'failed', taskId: task.id, tokenId, error: String(error) });
+      }
+    }
+  }
+
+  /** Hides every visible loan offer of a `loanOffer` task, for `cancelAll`; they lend until they expire. */
+  private async hideLoanOffers(task: ListingTask) {
+    if (!task.loanOffer || !this.market.loans) return;
+    const now = this.now().getTime();
+    const { offers } = await this.market.loans.loanBook(task.collection);
+    const visible = offers.filter((offer) => !offer.hidden && offer.expiration.getTime() > now);
+    if (visible.length > 0) await this.market.loans.hideLoanOffers(visible);
+    this.lending.delete(task.id);
   }
 
   /**
@@ -546,7 +1080,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
     scope: ListingScope,
     decision: Exclude<ListingDecision, { type: 'halt' }>,
   ): Promise<{
-    state: Exclude<ListingItemState, { status: 'failing' }>;
+    state: Exclude<ListingItemState, { status: 'failing' | 'sold' }>;
     listing: OwnListing | undefined;
   }> {
     if (decision.type === 'wait') {
@@ -563,8 +1097,124 @@ export class Runner extends EventEmitter<RunnerEvents> {
     return { state: { status: 'listing', listingId: listing.id, price: listing.price }, listing };
   }
 
+  /**
+   * With `bidExit`, the best bid of GONDI and OpenSea, the gas price and whether a transaction is
+   * unmined, read once for the round; `undefined` without it, or when a read fails, which is reported as `exit`
+   * and leaves the items to their listings.
+   */
+  private async readExitMarket(task: ListingTask): Promise<ExitMarket | undefined> {
+    if (!task.bidExit) return undefined;
+    try {
+      const [{ offer, gasPrice }, balances] = await Promise.all([
+        this.readExitOffer(task.collection),
+        this.market.walletBalances(),
+      ]);
+      return { offer, gasPrice, pendingTransaction: balances.pending };
+    } catch (error) {
+      this.emit('exit', {
+        status: 'failed',
+        taskId: task.id,
+        tokenId: undefined,
+        error: String(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Sells the held item into the round's offer when `decideExit` says so, and reports it as
+   * `exit`; what it tried, or `undefined` when it held. A failed sale counts against `maxPerDay`,
+   * is reported, and the item goes on to its listing; either way the round tries no other item.
+   */
+  private async exitItem(
+    task: ListingTask,
+    scope: ListingScope,
+    exitMarket: ExitMarket,
+    held: number,
+  ) {
+    const exit = task.bidExit;
+    if (!exit) return undefined;
+    const now = this.now();
+    const dayKey = `${task.id}#${dayStart(now).toISOString()}`;
+    const decision = decideExit({
+      exit,
+      minPrice: task.minPrice,
+      position: this.positions.find(
+        (position) => position.slug === scope.slug && position.tokenId === scope.tokenId,
+      ),
+      ...exitMarket,
+      ownTopBid: this.ownTopBid(task.collection),
+      bidsFull: this.bidsFull(task.collection, held),
+      soldToday: this.exitsByDay.get(dayKey) ?? 0,
+      now,
+    });
+    if (decision.type === 'hold') return undefined;
+    this.exitsByDay.set(dayKey, (this.exitsByDay.get(dayKey) ?? 0) + 1);
+    try {
+      await this.market.sellToOffer({
+        scope,
+        offer: decision.offer,
+        minProceeds: decision.minProceeds,
+      });
+    } catch (error) {
+      this.emit('exit', {
+        status: 'failed',
+        taskId: task.id,
+        tokenId: scope.tokenId,
+        error: String(error),
+      });
+      return { status: 'failed' as const };
+    }
+    this.exited.add(`${scope.slug}#${scope.tokenId}`);
+    this.emit('exit', {
+      status: 'sold',
+      taskId: task.id,
+      tokenId: scope.tokenId,
+      venue: decision.offer.venue,
+      netPrice: decision.offer.netPrice,
+      reason: decision.reason,
+    });
+    return { status: 'sold' as const, offer: decision.offer };
+  }
+
+  /**
+   * Whether no bid task on the collection can buy another item, so a held one may be sold at a
+   * loss. A task cannot buy once it is halted (disabled, `filled`, `floorMoved`, cancelled), while it
+   * waits on what it holds or has lost (`HOLDING_CAPS`), or once `held` items reach its `maxItems`;
+   * a collection with no bid task cannot buy either. A wait on balance, allowance or exposure passes,
+   * so it does not count.
+   */
+  private bidsFull(slug: string, held: number) {
+    return !this.runs
+      .filter(isBidRun)
+      .filter((run) => run.task.collection === slug)
+      .some(
+        (run) =>
+          run.state.status !== 'halted' &&
+          !(run.state.status === 'waiting' && HOLDING_CAPS.has(run.state.reason)) &&
+          (run.task.maxItems === undefined || held < run.task.maxItems),
+      );
+  }
+
+  /** The highest price the bid tasks' live bids on the collection offer, on any venue. */
+  private ownTopBid(slug: string) {
+    return this.runs
+      .filter(isBidRun)
+      .filter((run) => run.task.collection === slug)
+      .flatMap((run) => run.orders)
+      .reduce<bigint | null>(
+        (top, order) => (top === null || order.price > top ? order.price : top),
+        null,
+      );
+  }
+
+  /**
+   * What every other task's live bids commit against `exposureLimit`, before `current` bids: the
+   * tasks that share WETH with it (see `sharesWeth`) are left out, since its bid takes no more WETH
+   * than theirs already does, and the rest are counted by `exposureOf`.
+   */
   private committedByOthers(current: TaskRun) {
-    return this.runs.reduce((total, run) => (run === current ? total : total + run.commitment), 0n);
+    return exposureOf(this.runs.filter((run) => run !== current && !sharesWeth(run, current)));
   }
 
   private update(run: TaskRun, state: TaskState) {

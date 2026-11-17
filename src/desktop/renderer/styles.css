@@ -95,6 +95,20 @@ body {
   padding: 6px 24px;
 }
 
+.usageNotice {
+  align-items: center;
+  background: var(--card);
+  border-bottom: 1px solid var(--outline-variant);
+  display: flex;
+  font-size: 13px;
+  gap: 10px;
+  padding: 8px 24px;
+}
+
+.usageNotice span {
+  flex: 1;
+}
+
 .liveDot {
   background: currentColor;
   border-radius: 50%;
@@ -443,8 +457,7 @@ p {
 
 .button:focus-visible,
 .segmented button:focus-visible,
-input:not(.control input):focus-visible,
-select:not(.control select):focus-visible {
+input:not(.control input):focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
@@ -499,8 +512,7 @@ select:not(.control select):focus-visible {
   border-color: var(--negative);
 }
 
-.control input,
-.control select {
+.control input {
   background: transparent;
   border: 0;
   outline: none;
@@ -512,27 +524,7 @@ select:not(.control select):focus-visible {
   padding: 0 12px;
 }
 
-.control select {
-  appearance: none;
-  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
-    linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position:
-    calc(100% - 17px) 50%,
-    calc(100% - 12px) 50%;
-  background-repeat: no-repeat;
-  background-size:
-    5px 5px,
-    5px 5px;
-  cursor: pointer;
-  padding-right: 28px;
-}
-
-.control select option {
-  background: var(--card);
-}
-
-.control input:disabled,
-.control select:disabled {
+.control input:disabled {
   color: var(--outline);
 }
 
@@ -949,11 +941,12 @@ select:not(.control select):focus-visible {
   min-width: 0;
 }
 
-.venueSelect {
+.select {
   padding-left: 0;
 }
 
-.venueSelect button {
+.select button {
+  align-items: center;
   background-color: transparent;
   background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
     linear-gradient(135deg, currentColor 50%, transparent 50%);
@@ -972,17 +965,24 @@ select:not(.control select):focus-visible {
   font: inherit;
   height: 100%;
   outline: none;
+  min-width: 0;
+  overflow: hidden;
   padding: 0 28px 0 12px;
   text-align: left;
+  white-space: nowrap;
 }
 
-.venueSelect button:disabled {
+.select button:disabled {
   color: var(--outline);
   cursor: default;
 }
 
-.venueSelect .pickerList li {
+.select .pickerList li {
   display: flex;
+}
+
+.traitPicker .pickerList li {
+  display: block;
 }
 
 .infoTip {

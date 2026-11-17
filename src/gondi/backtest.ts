@@ -87,6 +87,19 @@ export class BacktestMarket implements Market {
     throw new Error('a backtest wraps no ETH');
   }
 
+  /** The recording holds no bids to sell into, so a backtest never sells a held item. */
+  async exitOffer() {
+    return null;
+  }
+
+  async gasPrice() {
+    return 0n;
+  }
+
+  async sellToOffer(): Promise<void> {
+    throw new Error('a backtest sells into no offers');
+  }
+
   /** The first moment the history covers. */
   start() {
     return new Date(
@@ -359,6 +372,8 @@ export const runBacktest = async ({
   fillModel: FillModel;
   onRound?: (report: RoundReport, at: Date) => Promise<void> | void;
 }): Promise<BacktestResult> => {
+  const traitBid = file.tasks.find((task) => task.kind === 'traitBid');
+  if (traitBid) throw new Error(`a backtest replays collection bids only, not ${traitBid.id}`);
   const market = new BacktestMarket(history, fillModel);
   const start = market.start();
   const lossLimits = file.lossLimits && { ...file.lossLimits, since: start };

@@ -130,6 +130,19 @@ describe('BacktestMarket.fillWith', () => {
 });
 
 describe('runBacktest', () => {
+  test('refuses a trait bid, which a recorded collection market cannot replay', async () => {
+    const traitTask = {
+      ...bidTask,
+      id: 'blue',
+      kind: 'traitBid',
+      trait: { type: 'Background', value: 'Blue' },
+    };
+
+    await expect(
+      runBacktest({ history: historyOf(), file: tasksFileOf([traitTask]), fillModel: 'strict' }),
+    ).rejects.toThrow('a backtest replays collection bids only, not blue');
+  });
+
   test('buys from a seller, lists at the floor and sells to a buyer', async () => {
     const pushed: Date[] = [];
     const result = await runBacktest({
