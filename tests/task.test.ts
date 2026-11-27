@@ -132,10 +132,46 @@ describe('parseTasksFile lossLimits', () => {
     ).toEqual({ dailyUsd: 3_000, weeklyUsd: 10_000, since: new Date('2030-01-01T00:00:00Z') });
   });
 
+  test("reads each collection's caps as percents of its floor, with no wallet cap", () => {
+    const perCollection = { dailyFloorPercent: 1.5, weeklyFloorPercent: 5 };
+    expect(
+      tasksFileOf([], { lossLimits: { perCollection, since: '2030-01-01T00:00:00Z' } }).lossLimits,
+    ).toEqual({ perCollection, since: new Date('2030-01-01T00:00:00Z') });
+  });
+
+  test('reads the minimum caps of each collection into wei', () => {
+    expect(
+      tasksFileOf([], {
+        lossLimits: {
+          perCollection: {
+            dailyFloorPercent: 1,
+            weeklyFloorPercent: 3,
+            minDailyEth: '0.01',
+            minWeeklyEth: '0.03',
+          },
+          since: '2030-01-01T00:00:00Z',
+        },
+      }).lossLimits?.perCollection,
+    ).toEqual({
+      dailyFloorPercent: 1,
+      weeklyFloorPercent: 3,
+      minDailyEth: 10_000_000_000_000_000n,
+      minWeeklyEth: 30_000_000_000_000_000n,
+    });
+  });
+
   test.each([
     ['a cap of zero', { dailyUsd: 0, weeklyUsd: 10_000, since: '2030-01-01T00:00:00Z' }],
     ['a missing since', { dailyUsd: 3_000, weeklyUsd: 10_000 }],
     ['a since that is not a date', { dailyUsd: 3_000, weeklyUsd: 10_000, since: 'monday' }],
+    ['no cap at all', { since: '2030-01-01T00:00:00Z' }],
+    [
+      'a percent of floor over 100',
+      {
+        perCollection: { dailyFloorPercent: 101, weeklyFloorPercent: 5 },
+        since: '2030-01-01T00:00:00Z',
+      },
+    ],
   ])('rejects %s', (_case, lossLimits) => {
     expect(() => tasksFileOf([], { lossLimits })).toThrow();
   });
@@ -299,5 +335,31 @@ describe('marginWarnings', () => {
     ],
   ])('stays quiet for %s', (_case, tasks) => {
     expect(marginWarnings(tasksFileOf(tasks))).toEqual([]);
+  });
+});
+
+describe('parseTasksFile pricing safeguards', () => {
+  const lossLimits = { dailyUsd: 400, since: '2030-01-01T00:00:00Z' };
+
+  test('fills the defaults of reference and behindGondi on bids and listings', () => {
+    expect(taskOf({ reference: {}, behindGondi: {} })).toMatchObject({
+      reference: { halfLifeHours: 24, belowPercent: 2 },
+      behindGondi: { percent: 1 },
+    });
+    const listing = tasksFileOf(
+      [listingTaskJson({ aboveCost: {}, reference: {}, behindGondi: {} })],
+      { lossLimits },
+    ).tasks[0];
+    expect(listing).toMatchObject({
+      aboveCost: { marginPercent: 0 },
+      reference: { halfLifeHours: 24, maxBelowPercent: 1 },
+      behindGondi: { percent: 1 },
+    });
+  });
+
+  test('rejects aboveCost without lossLimits, which say what an item cost', () => {
+    expect(() => tasksFileOf([listingTaskJson({ aboveCost: {} })])).toThrow(
+      'aboveCost needs lossLimits',
+    );
   });
 });

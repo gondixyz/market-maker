@@ -511,6 +511,7 @@ describe('reconcile with a resale price', () => {
   test.each([
     ['maxHeldValue', { task: taskOf({ maxHeldValue: '10' }), snapshot: snapshotOf({ held: 1 }) }],
     ['exposureLimit', { exposureAvailable: eth('1') }],
+    ['lossLimit', { lossLimitReached: true }],
   ] as const)('stands in for a wait on %s', (reason, overrides) => {
     expect(decide({ ...overrides, resalePrice: eth('7') })).toMatchObject({
       type: 'resale',
@@ -523,7 +524,6 @@ describe('reconcile with a resale price', () => {
   });
 
   test.each([
-    ['at a loss cap', { lossLimitReached: true }, 'lossLimit'],
     [
       'on a crossed book',
       { snapshot: snapshotOf({ held: 2, floorPrice: eth('7') }) },
@@ -535,7 +535,7 @@ describe('reconcile with a resale price', () => {
       'maxItemsHeld',
     ],
   ] as const)('still waits %s', (_name, overrides, reason) => {
-    expect(decide({ task, snapshot: full, resalePrice: eth('7'), ...overrides })).toMatchObject({
+    expect(decide({ task, resalePrice: eth('7'), ...overrides })).toMatchObject({
       type: 'wait',
       reason,
     });

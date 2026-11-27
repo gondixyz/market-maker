@@ -14,7 +14,6 @@ const bid = (id: number, minutesAgo: number, overrides: Partial<ApiOrder> = {}):
   __typename: 'CollectionOrder',
   id,
   price: 1n,
-  steppedPrice: null,
   currencyAddress: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
   maker: '0x0000000000000000000000000000000000000001',
   isAsk: false,
@@ -68,6 +67,13 @@ class StubApi {
 
   async priceStep() {
     return 1n;
+  }
+
+  floorReads: Date[][] = [];
+
+  async floorPricesAt({ timestamps }: { timestamps: Date[] }) {
+    this.floorReads.push(timestamps);
+    return timestamps.map((_, index) => (index === 0 ? null : 1.5));
   }
 
   async saleFeeBps() {
@@ -328,13 +334,8 @@ describe('bidLevels', () => {
   test.each([
     ['no orders', [], []],
     ['one level per distinct price, best first', [9n, 7n, 9n, 8n], [9n, 8n, 7n]],
-    ['the stepped price where the API steps it', [9n, [10n, 8n]], [9n, 8n]],
-  ] as [string, (bigint | [bigint, bigint])[], bigint[]][])('%s', (_case, prices, levels) => {
-    const orders = prices.map((price, index) =>
-      Array.isArray(price)
-        ? bid(index, 1, { price: price[0], steppedPrice: price[1] })
-        : bid(index, 1, { price }),
-    );
+  ] as [string, bigint[], bigint[]][])('%s', (_case, prices, levels) => {
+    const orders = prices.map((price, index) => bid(index, 1, { price }));
 
     expect(bidLevels(orders)).toEqual(levels);
   });
@@ -421,7 +422,7 @@ describe('GondiMarket.listingMarket', () => {
   test('reads the best competing bid from the price API, beside the cheapest ask', async () => {
     const api = new StubApi();
     const priceApi = new StubApi(1_234);
-    priceApi.competing = [bid(4, 1, { price: 5n, steppedPrice: 5n })];
+    priceApi.competing = [bid(4, 1, { price: 5n })];
     const market = new GondiMarket(
       { ...gondi, isApprovedNFTForAll: async () => true } as unknown as Gondi,
       api as unknown as GondiApi,
@@ -432,6 +433,43 @@ describe('GondiMarket.listingMarket', () => {
 
     expect(book.bestCompetingBid).toBe(5n);
     expect(priceApi.competingReads.map((filter) => filter.side).sort()).toEqual(['ASK', 'BID']);
+  });
+});
+
+describe('GondiMarket best price venues', () => {
+  test.each([
+    ['a GONDI bid', 'MarketPlace.Native', true],
+    ['an OpenSea bid', 'MarketPlace.OpenSea', false],
+  ])('says whether the best competing bid is on GONDI: %s', async (_case, marketPlace, onGondi) => {
+    const api = new StubApi();
+    api.competing = [bid(3, 1, { price: 5n, marketPlace }), bid(4, 1, { price: 4n })];
+
+    const snapshot = await marketOn(api).snapshot(scope, new Date());
+    const book = await new GondiMarket(
+      { ...gondi, isApprovedNFTForAll: async () => true } as unknown as Gondi,
+      api as unknown as GondiApi,
+    ).listingMarket('pudgypenguins');
+
+    expect(snapshot.bestCompetingBidOnGondi).toBe(onGondi);
+    expect(book.lowestCompetingAskOnGondi).toBe(onGondi);
+  });
+});
+
+describe('GondiMarket.floorHistory', () => {
+  test('reads the floors a few dozen at a time, in wei', async () => {
+    const api = new StubApi();
+    const timestamps = Array.from({ length: 30 }, (_, index) => new Date(index * 60_000));
+
+    const floors = await marketOn(api).floorHistory('pudgypenguins', timestamps);
+
+    expect(api.floorReads.map((read) => read.length)).toEqual([24, 6]);
+    expect([floors.length, floors[0], floors[1], floors[24]]).toEqual([30, null, eth('1.5'), null]);
+  });
+
+  test('has no history to read in a price replay', async () => {
+    await expect(
+      marketOn(new StubApi(), new StubApi()).floorHistory('pudgypenguins', [new Date()]),
+    ).rejects.toThrow('no floor history');
   });
 });
 

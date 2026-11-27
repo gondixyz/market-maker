@@ -1,5 +1,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 
+import { dayStart } from '../src/engine/pnl';
+import { belowBy, nextReference } from '../src/engine/reference';
 import { type RoundReport, Runner } from '../src/engine/runner';
 import { VenueMarket } from '../src/engine/venueMarket';
 import {
@@ -472,6 +474,54 @@ describe('Runner with loss limits', () => {
     expect(market.cancelled).toEqual(['100']);
   });
 
+  test("a collection's own cap withdraws only that collection's bids", async () => {
+    const market = new FakeMarket();
+    market.tradeHistory = [underwaterBuy(NOW)];
+    const runner = runnerFor(market, [task('punks'), task('azuki', { collection: 'azuki' })], {
+      lossLimits: {
+        perCollection: { dailyFloorPercent: 5, weeklyFloorPercent: 20 },
+        since: '2029-12-01T00:00:00Z',
+      },
+    });
+
+    await runner.round();
+
+    expect(runner.states().get('punks')).toEqual({ status: 'waiting', reason: 'lossLimit' });
+    expect(runner.states().get('azuki')).toMatchObject({ status: 'bidding' });
+  });
+
+  test.each([
+    ['bids on: its loss predates the day and the week', eth('10'), { status: 'bidding' }],
+    [
+      'stops without the floor the windows started at, counting the whole loss',
+      undefined,
+      { status: 'waiting', reason: 'lossLimit' },
+    ],
+  ])('an item bought last week and held underwater since %s', async (_case, floor, state) => {
+    const market = new FakeMarket();
+    market.historicFloor = floor;
+    market.tradeHistory = [underwaterBuy(new Date(NOW.getTime() - 8 * 24 * 60 * 60_000))];
+    const runner = runnerFor(market, [task('punks')], LOSS_LIMITS);
+
+    await runner.round();
+
+    expect(runner.states().get('punks')).toMatchObject(state);
+  });
+
+  test("counts a carried item's loss when a dust print sits on the window's start", async () => {
+    const market = new FakeMarket();
+    market.floorHistory = async (_slug, timestamps) =>
+      timestamps.map((timestamp) =>
+        timestamp.getTime() === dayStart(NOW).getTime() ? eth('0.001') : eth('11'),
+      );
+    market.tradeHistory = [underwaterBuy(new Date(NOW.getTime() - 8 * 24 * 60 * 60_000))];
+    const runner = runnerFor(market, [task('punks')], LOSS_LIMITS);
+
+    await runner.round();
+
+    expect(runner.states().get('punks')).toEqual({ status: 'waiting', reason: 'lossLimit' });
+  });
+
   test('a read that fails stops the bidding', async () => {
     const market = new FakeMarket();
     market.failFills = true;
@@ -511,6 +561,7 @@ describe('Runner with loss limits', () => {
         dailyLossUsd: 0,
         weeklyLossUsd: 0,
         reached: false,
+        collections: [],
         staleReason: 'Error: API unavailable',
       });
     });
@@ -598,7 +649,22 @@ describe('Runner with loss limits', () => {
     await runner.round();
 
     expect(reports).toEqual([
-      { status: 'measured', dailyLossUsd: 2_000, weeklyLossUsd: 2_000, reached: true },
+      {
+        status: 'measured',
+        dailyLossUsd: 2_000,
+        weeklyLossUsd: 2_000,
+        reached: true,
+        collections: [
+          {
+            slug: 'pudgypenguins',
+            dailyLoss: eth('1'),
+            weeklyLoss: eth('1'),
+            dailyLimit: null,
+            weeklyLimit: null,
+            reached: false,
+          },
+        ],
+      },
     ]);
   });
 });
@@ -1084,6 +1150,26 @@ describe('Runner with loan offers', () => {
     expect([market.lending.hidden, reads]).toEqual([['0xloan:1'], 3]);
   });
 
+  test('stops reading once only expired offers are left, which nothing hides', async () => {
+    const market = new FakeLendingMarket();
+    market.heldTokenIds = [1n];
+    let reads = 0;
+    const read = market.lending.loanBook.bind(market.lending);
+    market.lending.loanBook = async () => {
+      reads++;
+      return read();
+    };
+    const runner = runnerFor(market, [lending()]);
+    await runner.round();
+    market.heldTokenIds = [];
+    market.lending.offers = [loanOfferOf({ expiration: NOW })];
+
+    await runner.round();
+    await runner.round();
+
+    expect([market.lending.hidden, reads]).toEqual([[], 2]);
+  });
+
   test('leaves the offer of an item whose GONDI read fails', async () => {
     const market = new FakeLendingMarket();
     market.heldTokenIds = [1n];
@@ -1327,6 +1413,75 @@ describe('Runner with a bid exit', () => {
     expect(market.exitSales).toHaveLength(sales);
   });
 
+  test.each([
+    [
+      'holds under the bid a sale would let the collection place again',
+      2,
+      eth('100'),
+      'maxItemsHeld' as const,
+      0,
+    ],
+    [
+      'sells while the bid waits on an allowance no sale restores',
+      1,
+      0n,
+      'insufficientAllowance' as const,
+      1,
+    ],
+  ])('with a stop loss in reach, %s', async (_name, held, allowance, reason, sales) => {
+    const market = marketHolding([1n, 2n]);
+    market.market.held = held;
+    market.market.allowance = allowance;
+    market.market.bestCompetingBid = eth('8.5');
+    market.exitBid = { id: '0xoffer', venue: 'gondi', netPrice: eth('9.45') };
+    const bid = task('pudgy-buy', {
+      maxItems: 2,
+      maxPrice: '9.7',
+      pricing: { mode: 'fixed', price: '9.65' },
+    });
+    const runner = runnerFor(market, [bid, exitTask()], LOSS_LIMITS);
+
+    await runner.round();
+
+    expect(runner.states().get('pudgy-buy')).toEqual({ status: 'waiting', reason });
+    expect(market.exitSales).toHaveLength(sales);
+  });
+
+  test('takes a profit under the bid’s target when the sale leaves the collection at maxItems', async () => {
+    const market = marketHolding([1n, 2n, 3n]);
+    market.market.held = 3;
+    market.market.bestCompetingBid = eth('8.5');
+    const bid = task('pudgy-buy', {
+      maxItems: 2,
+      maxPrice: '9.7',
+      pricing: { mode: 'fixed', price: '9.65' },
+    });
+
+    await runnerFor(market, [bid, exitTask()], LOSS_LIMITS).round();
+
+    expect(market.exitSales).toHaveLength(1);
+  });
+
+  test('takes a profit under the target of a bid stopped by lossLimits', async () => {
+    const market = marketHolding([1n, 2n]);
+    market.tradeHistory = [
+      { ...bought(1n), price: eth('10.45') },
+      { ...bought(2n), price: eth('9.5') },
+    ];
+    market.market.bestCompetingBid = eth('8.5');
+    const bid = task('pudgy-buy', {
+      maxItems: 3,
+      maxPrice: '9.7',
+      pricing: { mode: 'fixed', price: '9.65' },
+    });
+    const runner = runnerFor(market, [bid, exitTask()], LOSS_LIMITS);
+
+    await runner.round();
+
+    expect(runner.states().get('pudgy-buy')).toEqual({ status: 'waiting', reason: 'lossLimit' });
+    expect(market.exitSales.map((sale) => sale.scope.tokenId)).toEqual([2n]);
+  });
+
   test('sells at a loss once a bid task without maxItems has bought its quantity', async () => {
     const market = marketHolding([1n]);
     market.exitBid = { id: '0xoffer', venue: 'gondi', netPrice: eth('9.45') };
@@ -1452,6 +1607,62 @@ describe('Runner with a resale bid', () => {
     expect(gondi.placed.length + openSea.placed.length).toBe(2);
   });
 
+  test('leaves the offer to the other venue when the best other bid is on its own', async () => {
+    const gondi = marketAtMaxItems();
+    const openSea = marketAtMaxItems();
+    gondi.exitBid = { id: 'gondi-offer', venue: 'gondi', netPrice: eth('9.6') };
+    openSea.exitBid = null;
+    const runner = new Runner(
+      new VenueMarket(gondi, { gondi, opensea: openSea }),
+      tasksFileOf(
+        [resaleTask('gondi-buy'), resaleTask('opensea-buy', { venue: 'opensea' }), exitTask],
+        { ...LOSS_LIMITS, resaleLimit: '10' },
+      ),
+      NOW,
+      () => NOW,
+    );
+
+    await runner.round();
+
+    expect(gondi.placed).toEqual([]);
+    expect(openSea.placed.map((placed) => placed.price)).toEqual([eth('9.41')]);
+    expect(runner.states().get('gondi-buy')).toEqual({ status: 'waiting', reason: 'maxItemsHeld' });
+  });
+
+  test.each([
+    ['keeps the resale offer at a loss cap it measured', false, 1],
+    ['keeps none at a loss cap it could not measure', true, 0],
+  ])('%s', async (_name, failFills, placed) => {
+    const market = marketAtMaxItems(0);
+    market.tradeHistory = [underwaterBuy(NOW)];
+    market.failFills = failFills;
+
+    const runner = resaleRunner(market, [resaleTask('pudgy-buy', { maxItems: 2 }), exitTask]);
+    await runner.round();
+
+    expect(market.placed).toHaveLength(placed);
+    if (placed) {
+      expect(runner.states().get('pudgy-buy')).toMatchObject({ resale: 'lossLimit' });
+    }
+  });
+
+  test('still stop-loss sells while the resale offer stands in for a measured loss cap', async () => {
+    const market = marketAtMaxItems();
+    market.heldTokenIds = [1n];
+    market.tradeHistory = [underwaterBuy(new Date(NOW.getTime() - 2 * 60 * 60_000))];
+    const exit = listingTaskJson({
+      id: 'pudgy-all',
+      tokenId: undefined,
+      bidExit: { afterHours: 1, maxLossPercent: 10 },
+    });
+    const runner = resaleRunner(market, [resaleTask('pudgy-buy', { maxItems: 2 }), exit]);
+
+    await runner.round();
+
+    expect(runner.states().get('pudgy-buy')).toMatchObject({ resale: 'lossLimit' });
+    expect(market.exitSales.map((sale) => sale.scope.tokenId)).toEqual([1n]);
+  });
+
   test('keeps one offer per collection', async () => {
     const market = marketAtMaxItems();
 
@@ -1507,5 +1718,80 @@ describe('Runner with a resale bid', () => {
     await runner.round();
 
     expect(market.placed).toEqual([]);
+  });
+});
+
+describe('Runner with pricing safeguards', () => {
+  const floorBid = (overrides: object = {}) =>
+    task('pudgy-buy', { pricing: { mode: 'floor', steps: 1 }, maxPrice: '20', ...overrides });
+
+  test("seeds a bid's reference from the floor history, so a jump does not lift the bid", async () => {
+    const market = new FakeMarket();
+    market.historicFloor = eth('9');
+
+    await runnerFor(market, [floorBid({ reference: { belowPercent: 2 } })]).round();
+
+    expect(market.placed.map((bid) => bid.price)).toEqual([eth('8.84')]);
+  });
+
+  test('starts the reference at the first floor without a history', async () => {
+    const market = new FakeMarket();
+
+    await runnerFor(market, [floorBid({ reference: { belowPercent: 2 } })]).round();
+
+    expect(market.placed.map((bid) => bid.price)).toEqual([eth('9.8')]);
+  });
+
+  test('lists an item at no less than it cost once fees are paid', async () => {
+    const market = new FakeMarket();
+    market.heldTokenIds = [1n, 2n];
+    market.tradeHistory = [underwaterBuy(NOW)];
+    const inventory = listingTaskJson({ id: 'pudgy-all', tokenId: undefined, aboveCost: {} });
+
+    await runnerFor(market, [inventory], LOSS_LIMITS).round();
+
+    expect(market.placedListings.map((listing) => [listing.scope.tokenId, listing.price])).toEqual([
+      [1n, 11058201058201058202n],
+      [2n, eth('9.99')],
+    ]);
+  });
+
+  test("leaves a crossed book's dust ask out of a listing's reference", async () => {
+    const market = new FakeMarket();
+    let now = NOW;
+    const hoursLater = (hours: number) => new Date(NOW.getTime() + hours * 60 * 60_000);
+    const file = tasksFileOf([listingTaskJson({ reference: { maxBelowPercent: 1 } })]);
+    const runner = new Runner(market, file, NOW, () => now);
+    await runner.round();
+    market.listingBook = {
+      ...market.listingBook,
+      lowestCompetingAsk: eth('0.01'),
+      bestCompetingBid: eth('5'),
+    };
+    for (const hours of [2, 4, 6]) {
+      now = hoursLater(hours);
+      await runner.round();
+    }
+    market.listingBook = {
+      ...market.listingBook,
+      lowestCompetingAsk: eth('9'),
+      bestCompetingBid: null,
+    };
+    market.ownListings = [];
+    now = hoursLater(6);
+
+    await runner.round();
+
+    const average = nextReference({ price: eth('10'), at: NOW }, eth('9'), now, 24).price;
+    expect(market.placedListings.at(-1)?.price).toBe(belowBy(average, 1));
+  });
+
+  test('sits above a cheapest competing listing on GONDI', async () => {
+    const market = new FakeMarket();
+    market.listingBook = { ...market.listingBook, lowestCompetingAskOnGondi: true };
+
+    await runnerFor(market, [listingTaskJson({ behindGondi: { percent: 1 } })]).round();
+
+    expect(market.placedListings.map((listing) => listing.price)).toEqual([eth('10.1')]);
   });
 });

@@ -54,6 +54,8 @@ export type BidSnapshot = {
    * the trait and the collection bids.
    */
   bestCompetingBid: bigint | null;
+  /** Whether `bestCompetingBid` is a bid on GONDI's own book; unset when the market cannot tell. */
+  bestCompetingBidOnGondi?: boolean;
   /**
    * The competing price levels, best first, the wallet's own bids excluded: at least the scope's
    * `levels` when the book holds them, which `level` pricing joins.
@@ -85,6 +87,8 @@ export type OwnListing = {
 export type ListingMarket = {
   /** The cheapest active listing of another item in the collection, or `null` when there is none. */
   lowestCompetingAsk: bigint | null;
+  /** Whether `lowestCompetingAsk` is a GONDI listing; unset when the market cannot tell. */
+  lowestCompetingAskOnGondi?: boolean;
   /** The best competing bid, which an ask under it contradicts (`crossedBook`); `null` when none. */
   bestCompetingBid: bigint | null;
   /** Whether the marketplace may move the collection's items out of the wallet. */
@@ -264,6 +268,12 @@ export interface Market extends ExitVenue {
   saleTerms(slug: string): Promise<SaleTerms>;
   /** The current price of one ETH in USD. */
   ethUsdPrice(): Promise<number>;
+  /**
+   * The collection's floor at each of `timestamps`, `null` where it had none, to seed a task's
+   * `reference`; unset when the market keeps no history, and the reference starts from the first
+   * floor a round reads.
+   */
+  floorHistory?(slug: string, timestamps: Date[]): Promise<(bigint | null)[]>;
   /**
    * The wallet's ETH and WETH, in wei, as of the latest block, and whether it has a transaction
    * sent but not yet mined, which those balances do not count yet.

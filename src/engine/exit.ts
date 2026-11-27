@@ -41,8 +41,9 @@ const stopLossFloor = (cost: bigint, maxLossPercent: number) =>
  * `maxLossPercent` of it (`stopLoss`). Never under the listing task's `minPrice`, never more than
  * `maxPerDay` items a UTC day, never above `maxGasGwei`, and never while a transaction of the
  * wallet's is unmined. An item with no buy in the ledger has no known cost, so it is held. It also
- * holds while the wallet's own bid on the collection is at or above the proceeds (`ownBidHigher`),
- * which would buy the item back for more than it sold for. A stop loss also waits until the
+ * holds while the wallet's own bid on the collection, live or the one the sale would let it place
+ * again, is at or above the proceeds (`ownBidHigher`), which would buy the item back for more than
+ * it sold for. A stop loss also waits until the
  * collection's bids can buy no more (`bidsFull`): while they still can, the item is not sold at a
  * loss (`stillBidding`).
  */
@@ -64,7 +65,10 @@ export const decideExit = ({
   offer: ExitOffer | null;
   gasPrice: bigint;
   pendingTransaction: boolean;
-  /** The wallet's own highest live bid on the collection, on any venue; `null` without one. */
+  /**
+   * The most the wallet's own bids on the collection pay, on any venue, live or bid again once
+   * the sale makes room; `null` without one.
+   */
   ownTopBid: bigint | null;
   /** Whether no bid task on the collection can buy another item (halted, full, or capped). */
   bidsFull: boolean;

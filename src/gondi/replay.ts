@@ -268,7 +268,6 @@ const replayOrder = (
   __typename: isAsk ? 'SingleNFTOrder' : 'CollectionOrder',
   id: +sample.at / REPLAY_STEP_MS,
   price: (isAsk ? sample.floorPrice : sample.bestBid)!,
-  steppedPrice: null,
   currencyAddress: isAsk ? zeroAddress : WETH,
   maker: REPLAY_MAKER,
   isAsk,

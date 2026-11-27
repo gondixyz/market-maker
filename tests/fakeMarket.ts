@@ -177,6 +177,14 @@ export class FakeMarket implements Market {
     return this.ethUsd;
   }
 
+  /** The floor every timestamp of `floorHistory` had; unset makes it throw, as a price replay does. */
+  historicFloor: bigint | undefined;
+
+  async floorHistory(_slug: string, timestamps: Date[]) {
+    if (this.historicFloor === undefined) throw new Error('no floor history');
+    return timestamps.map(() => this.historicFloor ?? null);
+  }
+
   async walletBalances() {
     return { ...this.balances };
   }

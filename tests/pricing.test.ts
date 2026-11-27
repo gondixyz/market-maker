@@ -167,6 +167,30 @@ describe('targetBidPrice', () => {
   });
 });
 
+describe('targetBidPrice safeguards', () => {
+  const floorTask = (overrides: object = {}) =>
+    taskOf({ pricing: { mode: 'floor', steps: 1 }, maxPrice: '20', ...overrides });
+
+  test('never bids above belowPercent under the reference price', () => {
+    const task = floorTask({ reference: { belowPercent: 2 } });
+    expect(targetBidPrice(task, snapshotOf(), eth('9.5'))).toBe(eth('9.31'));
+    expect(targetBidPrice(task, snapshotOf(), eth('11'))).toBe(eth('9.99'));
+    expect(targetBidPrice(task, snapshotOf(), null)).toBe(eth('9.99'));
+  });
+
+  test.each([
+    ['percent under a GONDI best bid', true, '9.95', { percent: 1 }, '9.85'],
+    ['at least one step under a GONDI best bid', true, '9.95', { percent: 0.01 }, '9.94'],
+    ['at the rule price when the best bid is not on GONDI', false, '9.95', { percent: 1 }, '9.99'],
+  ])('sits %s', (_case, onGondi, bestBid, behindGondi, price) => {
+    const snapshot = snapshotOf({
+      bestCompetingBid: eth(bestBid),
+      bestCompetingBidOnGondi: onGondi,
+    });
+    expect(targetBidPrice(floorTask({ behindGondi }), snapshot)).toBe(eth(price));
+  });
+});
+
 describe('ladderPrices', () => {
   const ladder = (offers: number, spacing: string, overrides: object = {}) =>
     taskOf({ ladder: { offers, spacing }, ...overrides });

@@ -85,7 +85,7 @@ describe('lossReport', () => {
       0,
     ],
   ])('%s', (_case, fills, dailyLossUsd, weeklyLossUsd) => {
-    expect(reportOf(fills)).toEqual({
+    expect(reportOf(fills)).toMatchObject({
       status: 'measured',
       dailyLossUsd,
       weeklyLossUsd,
@@ -111,6 +111,196 @@ describe('lossReport', () => {
     expect(reportOf([buy('2030-01-09T10:00:00Z', '10')], { terms })).toEqual({
       status: 'unmeasured',
       reason: 'no floor for pudgypenguins',
+    });
+  });
+
+  test('reports each collection traded this week, with no caps and never reached without perCollection', () => {
+    expect(reportOf([buy('2030-01-09T10:00:00Z', '11')])).toMatchObject({
+      collections: [
+        {
+          slug: 'pudgypenguins',
+          dailyLoss: eth('1.5'),
+          weeklyLoss: eth('1.5'),
+          dailyLimit: null,
+          weeklyLimit: null,
+          reached: false,
+        },
+      ],
+    });
+  });
+
+  test("caps each collection's loss at a percent of its own floor, apart from the others", () => {
+    const azuki = (fill: Fill): Fill => ({ ...fill, slug: 'azuki' });
+    const terms = new Map<string, SaleTerms>([
+      ...TERMS,
+      ['azuki', { floorPrice: eth('1'), feeBps: 500n }],
+    ]);
+    const report = lossReport({
+      ledger: ledgerOf(
+        [
+          buy('2030-01-09T08:00:00Z', '10.6'),
+          azuki(buy('2030-01-08T08:00:00Z', '1')),
+          azuki(sell('2030-01-08T10:00:00Z', '0.9')),
+        ],
+        LIMITS.since,
+      ),
+      terms,
+      ethUsd: 2_000,
+      now: NOW,
+      limits: {
+        since: LIMITS.since,
+        perCollection: { dailyFloorPercent: 10, weeklyFloorPercent: 20 },
+      },
+    });
+    expect(report).toMatchObject({
+      status: 'measured',
+      reached: false,
+      collections: [
+        {
+          slug: 'pudgypenguins',
+          dailyLoss: eth('1.1'),
+          dailyLimit: eth('1'),
+          weeklyLimit: eth('2'),
+          reached: true,
+        },
+        {
+          slug: 'azuki',
+          dailyLoss: 0n,
+          weeklyLoss: eth('0.145'),
+          dailyLimit: eth('0.1'),
+          weeklyLimit: eth('0.2'),
+          reached: false,
+        },
+      ],
+    });
+  });
+
+  test("raises a cheap collection's caps to the minimums in ETH", () => {
+    const report = lossReport({
+      ledger: ledgerOf([buy('2030-01-09T08:00:00Z', '10.6')], LIMITS.since),
+      terms: TERMS,
+      ethUsd: 2_000,
+      now: NOW,
+      limits: {
+        since: LIMITS.since,
+        perCollection: {
+          dailyFloorPercent: 1,
+          weeklyFloorPercent: 3,
+          minDailyEth: eth('1.2'),
+          minWeeklyEth: eth('0.1'),
+        },
+      },
+    });
+    expect(report).toMatchObject({
+      collections: [{ dailyLimit: eth('1.2'), weeklyLimit: eth('0.3'), reached: true }],
+    });
+  });
+
+  test('caps a collection with no floor at the minimums, when set', () => {
+    const terms = new Map([['pudgypenguins', { floorPrice: null, feeBps: 500n }]]);
+    const report = lossReport({
+      ledger: ledgerOf(
+        [buy('2030-01-09T08:00:00Z', '10'), sell('2030-01-09T10:00:00Z', '9.9')],
+        LIMITS.since,
+      ),
+      terms,
+      ethUsd: 2_000,
+      now: NOW,
+      limits: {
+        since: LIMITS.since,
+        perCollection: {
+          dailyFloorPercent: 1,
+          weeklyFloorPercent: 3,
+          minDailyEth: eth('1'),
+          minWeeklyEth: eth('2'),
+        },
+      },
+    });
+    expect(report).toMatchObject({
+      collections: [{ dailyLimit: eth('1'), weeklyLimit: eth('2'), reached: false }],
+    });
+  });
+
+  test('stops a collection that lost with no floor to set its caps', () => {
+    const terms = new Map([['pudgypenguins', { floorPrice: null, feeBps: 500n }]]);
+    const report = lossReport({
+      ledger: ledgerOf(
+        [buy('2030-01-09T08:00:00Z', '10'), sell('2030-01-09T10:00:00Z', '9')],
+        LIMITS.since,
+      ),
+      terms,
+      ethUsd: 2_000,
+      now: NOW,
+      limits: {
+        since: LIMITS.since,
+        perCollection: { dailyFloorPercent: 10, weeklyFloorPercent: 20 },
+      },
+    });
+    expect(report).toMatchObject({
+      reached: false,
+      collections: [{ slug: 'pudgypenguins', dailyLimit: null, reached: true }],
+    });
+  });
+
+  describe("with each window's starting floor", () => {
+    const withFloors = (fills: Fill[], day: string | null, week: string | null) =>
+      lossReport({
+        ledger: ledgerOf(fills, LIMITS.since),
+        terms: TERMS,
+        ethUsd: 2_000,
+        now: NOW,
+        limits: LIMITS,
+        windowFloors: new Map([
+          [
+            'pudgypenguins',
+            { day: day === null ? null : eth(day), week: week === null ? null : eth(week) },
+          ],
+        ]),
+      });
+
+    test.each([
+      [
+        'an item bought last week, underwater since, counts nothing in either window',
+        [buy('2030-01-02T08:00:00Z', '11')],
+        '10',
+        '10',
+        0,
+        0,
+      ],
+      [
+        "an item bought yesterday counts today only its fall since today's floor",
+        [buy('2030-01-08T08:00:00Z', '11')],
+        '10.5',
+        '10.5',
+        950,
+        3_000,
+      ],
+      [
+        "a sale today of last week's buy, against each window's start",
+        [buy('2030-01-02T08:00:00Z', '10'), sell('2030-01-09T10:00:00Z', '9')],
+        '9',
+        '12',
+        0,
+        2_900,
+      ],
+      [
+        'a paper gain that fades in the window, still above cost, is no loss',
+        [buy('2030-01-02T08:00:00Z', '8')],
+        '12',
+        '12',
+        0,
+        0,
+      ],
+      [
+        'a window with no floor counts the item against its cost',
+        [buy('2030-01-02T08:00:00Z', '11')],
+        '10',
+        null,
+        0,
+        3_000,
+      ],
+    ])('%s', (_case, fills, day, week, dailyLossUsd, weeklyLossUsd) => {
+      expect(withFloors(fills, day, week)).toMatchObject({ dailyLossUsd, weeklyLossUsd });
     });
   });
 

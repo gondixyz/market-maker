@@ -90,7 +90,9 @@ and the README's "Download" say how to open them.
   (or a listing) it posted among the wallet's own until a read shows it, it is cancelled, or two minutes pass. The
   `Runner` also keeps, in memory, the items it sold into other bids (the holdings index trails a
   sale), each `bidExit`'s count of sales per UTC day, which a restart starts again, when it first found
-  each listed item held, where a listing's `decay` starts, so a restart lists at full price again, and which
+  each listed item held, where a listing's `decay` starts, so a restart lists at full price again,
+  each task's `reference` moving average, which a restart seeds again from GONDI's floor history, each
+  collection's floor at the start of the loss windows, which a restart reads again, and which
   `openSeaListing` tasks may still have OpenSea listings to cancel, and which `loanOffer` tasks
   may still have loan offers to hide.
 - **Decisions are pure.** New behavior goes into `reconcile` or `pricing` with a table-style test,
