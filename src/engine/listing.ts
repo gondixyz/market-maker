@@ -1,5 +1,6 @@
-import { percentOf } from './basisPoints';
+import { basisPoints, BPS, percentOf } from './basisPoints';
 import type { ListingSnapshot, OwnListing } from './market';
+import { aboveBy, belowBy } from './reference';
 import type { ListingPricingRule, ListingTask } from './task';
 
 const MINIMUM_REFRESH_MARGIN_MS = 2 * 60_000;
@@ -31,7 +32,18 @@ export type ListingDecision =
   | { type: 'wait'; reason: ListingWaitReason; listing?: OwnListing }
   | { type: 'halt'; reason: 'filled' };
 
-export type DecideListingInput = {
+/** What an item cost the wallet, and what a sale of it pays away in royalties and fees. */
+export type ItemCost = { cost: bigint; feeBps: bigint };
+
+/** The prices a listing's safeguards hold it above, beside the market's snapshot. */
+export type ListingBounds = {
+  /** The task's smoothed cheapest competing listing, for its `reference`. */
+  referencePrice?: bigint | null;
+  /** What the item cost, for `aboveCost`; unset when the fills do not say. */
+  itemCost?: ItemCost;
+};
+
+export type DecideListingInput = ListingBounds & {
   task: ListingTask;
   snapshot: ListingSnapshot;
   now: Date;
@@ -87,21 +99,60 @@ export const decayedListingPrice = (
 };
 
 /**
+ * The least a sale at which pays back `cost` plus `marginPercent` of it once `feeBps` of the price
+ * is paid away, rounded up to the wei.
+ */
+export const breakEvenPrice = ({ cost, feeBps }: ItemCost, marginPercent: number) => {
+  const wanted = (cost * (BPS + basisPoints(marginPercent)) + BPS - 1n) / BPS;
+  const kept = BPS - feeBps;
+  return kept > 0n ? (wanted * BPS + kept - 1n) / kept : null;
+};
+
+/**
+ * The least the task lists at: `minPrice`, and above it whichever of its safeguards is set and
+ * higher: `aboveCost` over the item's `breakEvenPrice`, `reference` at most `maxBelowPercent` under
+ * the smoothed cheapest competing listing, and `behindGondi` `percent` above a cheapest competing
+ * listing on GONDI. `null` when `aboveCost` cannot be met at any price (fees of 100% or more).
+ */
+const listingFloor = (
+  task: ListingTask,
+  snapshot: ListingSnapshot,
+  { referencePrice = null, itemCost }: ListingBounds,
+): bigint | null => {
+  const floors = [task.minPrice];
+  if (task.aboveCost && itemCost) {
+    const breakEven = breakEvenPrice(itemCost, task.aboveCost.marginPercent);
+    if (breakEven === null) return null;
+    floors.push(breakEven);
+  }
+  if (task.reference && referencePrice !== null) {
+    floors.push(belowBy(referencePrice, task.reference.maxBelowPercent));
+  }
+  if (task.behindGondi && snapshot.lowestCompetingAskOnGondi && snapshot.lowestCompetingAsk) {
+    floors.push(aboveBy(snapshot.lowestCompetingAsk, task.behindGondi.percent));
+  }
+  return floors.reduce((highest, floor) => (floor > highest ? floor : highest));
+};
+
+/**
  * The price the listing should sit at now: the task's rule capped at `maxPrice`, lowered by its
- * `decay`, and held up at `minPrice`; or `null` when the rule has nothing to price from. Not
- * rounded: listings are not price-stepped.
+ * `decay`, and held up at its `listingFloor`, which may lift it over `maxPrice`, since selling
+ * under cost or into a dip is what those safeguards refuse; or `null` when the rule has nothing to
+ * price from. Not rounded: listings are not price-stepped.
  */
 export const targetListingPrice = (
   task: ListingTask,
   snapshot: ListingSnapshot,
   listedSince: Date,
   now: Date,
+  bounds: ListingBounds = {},
 ): bigint | null => {
   const rulePrice = ruleListingPrice(task.pricing, snapshot, task.maxPrice);
-  if (rulePrice === null) return null;
+  const floor = listingFloor(task, snapshot, bounds);
+  if (rulePrice === null || floor === null) return null;
   const capped = rulePrice > task.maxPrice ? task.maxPrice : rulePrice;
   const decayed = decayedListingPrice(capped, task.decay, listedSince, now);
-  return decayed < task.minPrice ? task.minPrice : decayed;
+  return decayed < floor ? floor : decayed;
 };
 
 const needsRefresh = (listing: OwnListing, task: ListingTask, now: Date, pollSeconds: number) =>
@@ -131,6 +182,7 @@ export const cheapestListing = (listings: OwnListing[]) =>
  * book, or without a price, it places nothing. A lower target lists again at that price, leaving the older listing to
  * expire; a higher target than a live listing waits for the user, since only an on-chain cancel
  * removes the cheaper one. A listing past its expiration is not live, whatever its status says.
+ * The input's `ListingBounds` hold the target up for `aboveCost` and `reference`.
  */
 export const decideListing = ({
   task,
@@ -138,6 +190,7 @@ export const decideListing = ({
   now,
   pollSeconds,
   listedSince,
+  ...bounds
 }: DecideListingInput): ListingDecision => {
   if (snapshot.ownListings.some((listing) => listing.executions > 0)) {
     return { type: 'halt', reason: 'filled' };
@@ -147,7 +200,7 @@ export const decideListing = ({
   if (isCrossed(snapshot.lowestCompetingAsk, snapshot.bestCompetingBid)) {
     return { type: 'wait', reason: 'crossedBook' };
   }
-  const price = targetListingPrice(task, snapshot, listedSince, now);
+  const price = targetListingPrice(task, snapshot, listedSince, now, bounds);
   if (price === null) return { type: 'wait', reason: 'noPrice' };
   const live = cheapestListing(snapshot.ownListings.filter((listing) => isLive(listing, now)));
   if (!live || price < live.price) return { type: 'place', price };
@@ -164,20 +217,11 @@ export const decideListing = ({
  * the item's live listings count.
  */
 export const decideInventoryItem = ({
-  task,
   snapshot,
-  now,
-  pollSeconds,
-  listedSince,
+  ...input
 }: DecideListingInput): Exclude<ListingDecision, { type: 'halt' }> | null => {
   if (!snapshot.owned) return null;
-  const ownListings = snapshot.ownListings.filter((listing) => isLive(listing, now));
-  const decision = decideListing({
-    task,
-    snapshot: { ...snapshot, ownListings },
-    now,
-    pollSeconds,
-    listedSince,
-  });
+  const ownListings = snapshot.ownListings.filter((listing) => isLive(listing, input.now));
+  const decision = decideListing({ ...input, snapshot: { ...snapshot, ownListings } });
   return decision.type === 'halt' ? null : decision;
 };

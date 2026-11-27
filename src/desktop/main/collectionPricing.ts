@@ -17,11 +17,9 @@ const TOP_BIDS_PAGE = 50;
  * failed read of it leaves it `undefined` rather than failing the step and floor the editor's
  * warnings need.
  *
- * IMPLEMENTATION NOTE: `listOrdersV2` sorts bids by `steppedPrice`, the price floored onto the
- * collection's bid step, so bids within one step come in no particular order (checked against the
- * production API: Decagon's 0.0001–0.0003 WETH offers all read `steppedPrice: 0` under a 0.01 step).
- * The top bid is the highest raw `price` of each book's first page, which holds its best step's
- * bids. The trait's and the collection's books are read apart, as `GondiMarket` reads them.
+ * IMPLEMENTATION NOTE: `listOrdersV2` sorted by `PRICE` descending ranks bids on their raw `price`,
+ * so the first order of each book is its best bid. The top bid is the highest of the books' first
+ * orders: the trait's and the collection's books are read apart, as `GondiMarket` reads them.
  */
 export const collectionPricing = async (
   api: Pick<GondiApi, 'collectionMarket' | 'priceStep' | 'orders' | 'traitMarket'>,

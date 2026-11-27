@@ -10,7 +10,6 @@ const listing = (id: number, marketPlace = 'MarketPlace.Native') => ({
   __typename: 'SingleNFTOrder',
   id: String(id),
   price: '1',
-  steppedPrice: null,
   currencyAddress: '0x0000000000000000000000000000000000000000',
   maker: MAKER,
   isAsk: true,

@@ -84,6 +84,11 @@ export class VenueMarket implements Market {
     return this.market.ethUsdPrice();
   }
 
+  async floorHistory(slug: string, timestamps: Date[]) {
+    if (!this.market.floorHistory) throw new Error('the market keeps no floor history');
+    return this.market.floorHistory(slug, timestamps);
+  }
+
   walletBalances() {
     return this.market.walletBalances();
   }

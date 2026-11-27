@@ -87,6 +87,10 @@ const sameTerms = (offer: OwnLoanOffer, terms: LoanTerms) =>
   offer.aprBps === terms.aprBps &&
   offer.durationSeconds === terms.durationSeconds;
 
+/** Whether a loan offer still shows to buyers: not hidden from the API, and not expired. */
+export const isVisibleLoanOffer = (offer: OwnLoanOffer, now: Date) =>
+  !offer.hidden && offer.expiration.getTime() > now.getTime();
+
 /**
  * Decides one item's loan offer, from its GONDI listing. Pure: the runner carries it out. The item
  * keeps one visible offer for a single loan at `loanTerms` of its cheapest live GONDI listing, the
@@ -107,9 +111,7 @@ export const decideLoanOffer = ({
   refreshMarginMs,
   now,
 }: DecideLoanOfferInput): LoanDecision => {
-  const visible = offers.filter(
-    (offer) => !offer.hidden && offer.expiration.getTime() > now.getTime(),
-  );
+  const visible = offers.filter((offer) => isVisibleLoanOffer(offer, now));
   const wait = (reason: LoanWaitReason): LoanDecision => ({ type: 'wait', reason, hide: visible });
   const listing = cheapestListing(gondiListings.filter((candidate) => isLive(candidate, now)));
   const target = listing ? loanTerms(terms, listing.price, minPrice) : null;

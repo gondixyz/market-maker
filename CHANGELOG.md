@@ -3,6 +3,26 @@
 What changed in each release of GONDI Market Maker, newest first. A release's section is also its
 notes on the GitHub Releases page.
 
+# 0.4.0
+
+- **Bids follow GONDI's new ranking**: GONDI now ranks bids on their exact price rather than
+  rounding them onto a price step, and the bot reads them the same way. Each distinct price is its
+  own level for `level` pricing, and the top bid the strategy editor shows is the highest bid
+  itself. Older versions read a field GONDI is retiring, so update before it goes.
+- **Loss caps per collection** (command line): `lossLimits.perCollection` caps each collection's
+  daily and weekly loss at a percent of its floor, with an optional minimum in ETH, and stops only
+  that collection's bids.
+- **Smoothed prices** (command line): with `reference`, a bid never goes above a margin under the
+  floor's moving average, and a listing never more than a margin under the cheapest other listing's.
+- **Sit behind GONDI** (command line): with `behindGondi`, a bid stays a percent under a best
+  competing bid on GONDI, and a listing a percent above a cheapest other listing on GONDI.
+- **Never sell at a loss** (command line): with `aboveCost`, a listing never asks less than the item
+  cost plus a margin, once royalties and fees are paid.
+- Loss caps now count only the loss made during the day or week, so a loss carried from yesterday
+  no longer stops today's bids.
+- A resale bid at a loss cap keeps its offer up, and only on the marketplace where it can fill.
+- Fixed: a stop-loss sale could sell an item below a bid the bot would place again right after.
+
 # 0.3.0
 
 - **Trait bids**: bid on the items of a collection that have one trait, such as `Background: Blue`,

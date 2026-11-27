@@ -167,6 +167,28 @@ describe('metricsText', () => {
     expect(metricsText(report)).not.toContain('market_maker_order_');
   });
 
+  test("reports each collection's loss against its own caps, in ETH", async () => {
+    const report = await reportOf([bidTask], {
+      lossLimits: {
+        perCollection: { dailyFloorPercent: 5, weeklyFloorPercent: 20 },
+        since: LOSS_LIMITS.lossLimits.since,
+      },
+    });
+    const lines = linesOf(metricsText(report));
+
+    expect(lines).toContain(
+      'market_maker_collection_loss_eth{collection="pudgypenguins",window="day"} 1',
+    );
+    expect(lines).toContain(
+      'market_maker_collection_loss_limit_eth{collection="pudgypenguins",window="week"} 2',
+    );
+    expect(lines).toContain(
+      'market_maker_collection_loss_limit_reached{collection="pudgypenguins"} 1',
+    );
+    expect(lines).toContain('market_maker_loss_limit_reached 0');
+    expect(lines.some((line) => line.startsWith('market_maker_loss_limit_usd{'))).toBe(false);
+  });
+
   test("keeps the loss measured when an older sale's collection cannot be read", async () => {
     const market = new FakeMarket();
     const lastMonth = new Date('2029-12-10T00:00:00Z');

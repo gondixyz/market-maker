@@ -1,5 +1,6 @@
 import { basisPoints, BPS, percentOf } from './basisPoints';
 import type { BidSnapshot } from './market';
+import { belowBy } from './reference';
 import type { BidTask, PricingRule } from './task';
 
 const floorToStep = (price: bigint, step: bigint) => (step > 0n ? price - (price % step) : price);
@@ -46,26 +47,47 @@ const ruleBidPrice = (rule: PricingRule, snapshot: BidSnapshot, minPrice: bigint
   }
 };
 
+const lowestOf = (prices: bigint[]) =>
+  prices.reduce((lowest, price) => (price < lowest ? price : lowest));
+
 /**
- * The most the task may bid: `maxPrice`, or less under `maxFloorPercent` of the floor. `null` when
+ * The most the task may bid: `maxPrice`, or less under `maxFloorPercent` of the floor, under its
+ * `reference`'s `belowPercent` below `referencePrice`, and, with `behindGondi`, under a best
+ * competing bid on GONDI by its `percent` and at least one price step. `null` when
  * `maxFloorPercent` is set and there is no floor to measure it against.
  */
-const bidCeiling = (task: BidTask, floorPrice: bigint | null) => {
-  if (task.maxFloorPercent === undefined) return task.maxPrice;
-  if (floorPrice === null) return null;
-  const floorShare = percentOf(floorPrice, task.maxFloorPercent);
-  return floorShare < task.maxPrice ? floorShare : task.maxPrice;
+const bidCeiling = (task: BidTask, snapshot: BidSnapshot, referencePrice: bigint | null) => {
+  const { floorPrice, bestCompetingBid, priceStep } = snapshot;
+  if (task.maxFloorPercent !== undefined && floorPrice === null) return null;
+  const caps = [task.maxPrice];
+  if (task.maxFloorPercent !== undefined && floorPrice !== null) {
+    caps.push(percentOf(floorPrice, task.maxFloorPercent));
+  }
+  if (task.reference && referencePrice !== null) {
+    caps.push(belowBy(referencePrice, task.reference.belowPercent));
+  }
+  if (task.behindGondi && snapshot.bestCompetingBidOnGondi && bestCompetingBid !== null) {
+    caps.push(
+      lowestOf([belowBy(bestCompetingBid, task.behindGondi.percent), bestCompetingBid - priceStep]),
+    );
+  }
+  return lowestOf(caps);
 };
 
 /**
  * The price a bid should sit at now: the task's rule, rounded down onto the marketplace's price
- * step and held between `minPrice` and the lower of `maxPrice` and `maxFloorPercent` of the floor.
- * `null` when there is nothing to price from (no floor yet, for a floor rule or a floor cap, or
- * fewer competing price levels than a level rule names) or no step lies within the limits.
+ * step and held between `minPrice` and the `bidCeiling`, which `referencePrice`, the task's
+ * smoothed floor, lowers with a `reference`. `null` when there is nothing to price from (no floor
+ * yet, for a floor rule or a floor cap, or fewer competing price levels than a level rule names)
+ * or no step lies within the limits.
  */
-export const targetBidPrice = (task: BidTask, snapshot: BidSnapshot): bigint | null => {
+export const targetBidPrice = (
+  task: BidTask,
+  snapshot: BidSnapshot,
+  referencePrice: bigint | null = null,
+): bigint | null => {
   const rulePrice = ruleBidPrice(task.pricing, snapshot, task.minPrice);
-  const ceiling = bidCeiling(task, snapshot.floorPrice);
+  const ceiling = bidCeiling(task, snapshot, referencePrice);
   if (rulePrice === null || ceiling === null) return null;
   const lowest = ceilToStep(task.minPrice, snapshot.priceStep);
   const highest = floorToStep(ceiling, snapshot.priceStep);
@@ -79,10 +101,15 @@ export const targetBidPrice = (task: BidTask, snapshot: BidSnapshot): bigint | n
  * `ladder`, its other offers on the multiples of `spacing` from at least one spacing below it, rounded down
  * onto the price step, without repeats and none under `minPrice`. Lower offers stay on the same
  * grid while the top price moves within one spacing, so such a move replaces only the top offer.
- * Empty when there is no target price.
+ * Empty when there is no target price. `referencePrice` is the task's smoothed floor, for a
+ * `reference`.
  */
-export const ladderPrices = (task: BidTask, snapshot: BidSnapshot): bigint[] => {
-  const top = targetBidPrice(task, snapshot);
+export const ladderPrices = (
+  task: BidTask,
+  snapshot: BidSnapshot,
+  referencePrice: bigint | null = null,
+): bigint[] => {
+  const top = targetBidPrice(task, snapshot, referencePrice);
   if (top === null) return [];
   if (!task.ladder) return [top];
   const { offers, spacing } = task.ladder;

@@ -5,16 +5,18 @@ import {
   decideInventoryItem,
   decideListing,
   isCrossed,
+  type ItemCost,
   type ListingDecision,
   type ListingWaitReason,
   refreshMarginMs,
 } from './listing';
-import { decideLoanOffer } from './loan';
+import { decideLoanOffer, isVisibleLoanOffer } from './loan';
 import type {
   BidScope,
   BidSnapshot,
   ExitOffer,
   Fill,
+  ListingMarket,
   ListingScope,
   LoanBook,
   Market,
@@ -25,16 +27,20 @@ import type {
 } from './market';
 import { decideMirror } from './mirror';
 import {
+  carriedCollections,
   dayStart,
   ledgerOf,
   type LossReport,
   lossReport,
+  type PerWindow,
   pnlOf,
   type PnlReport,
   type Position,
   tradedCollections,
   valuedCollections,
+  weekStart,
 } from './pnl';
+import { ladderPrices } from './pricing';
 import {
   type Decision,
   type HaltReason,
@@ -44,6 +50,7 @@ import {
   type ResaleWaitReason,
   type WaitReason,
 } from './reconcile';
+import { nextReference, type ReferencePrice } from './reference';
 import {
   type BidTask,
   type ListingTask,
@@ -107,6 +114,11 @@ type TaskRun<RunTask extends Task = Task> = {
   /** The book as the task's latest read saw it, the wallet's own orders excluded; `null` before. */
   bestCompetingBid: bigint | null;
   lowestCompetingAsk: bigint | null;
+  /**
+   * The top price the task's latest bid snapshot priced its offers at, whether or not a cap kept
+   * them down; `null` before one or when it could not be priced.
+   */
+  targetPrice: bigint | null;
   /** The orders the task's latest round left live; a failing round keeps the previous ones. */
   orders: LiveOrder[];
 };
@@ -201,6 +213,11 @@ const LOSS_READ_GRACE_MS = 2 * 60_000;
 
 /** How far before the latest fill read each round re-reads, for sales the API indexes late. */
 const FILL_REREAD_MS = 60 * 60_000;
+const HOUR_MS = 60 * 60_000;
+/** How far either side of a loss window's start `readWindowFloors` also samples the floor. */
+const WINDOW_FLOOR_SAMPLE_MS = HOUR_MS;
+/** The most floor samples a `reference` is seeded from: one market read of a few dozen. */
+const MAX_REFERENCE_SEED_SAMPLES = 72;
 
 const fillKey = (fill: Fill) =>
   `${fill.slug}#${fill.tokenId}#${fill.side}#${fill.timestamp.getTime()}#${fill.price}`;
@@ -214,9 +231,22 @@ const scopeOf = (task: BidTask): BidScope => ({
   ...(task.pricing.mode === 'level' && { levels: task.pricing.level }),
 });
 
-/** Whether bidding stops for the loss: at a cap, or not measured at all. */
-const lossLimitReached = (loss: LossReport | undefined) =>
-  loss !== undefined && (loss.status === 'unmeasured' || loss.reached);
+/**
+ * Whether the round measured the loss itself, rather than not at all or by standing in an earlier
+ * measure for a failed read: a `resaleBid` offer stands in for a loss cap only then.
+ */
+const freshlyMeasured = (loss: LossReport | undefined) =>
+  loss?.status === 'measured' && loss.staleReason === undefined;
+
+/**
+ * Whether bidding on the collection `slug` stops for the loss: the wallet's or the collection's at
+ * a cap, or not measured at all.
+ */
+const lossLimitReached = (loss: LossReport | undefined, slug: string) =>
+  loss !== undefined &&
+  (loss.status === 'unmeasured' ||
+    loss.reached ||
+    loss.collections.some((collection) => collection.slug === slug && collection.reached));
 
 const bidOrder = (bid: OwnBid): LiveOrder => ({
   side: 'bid',
@@ -294,6 +324,36 @@ const HOLDING_CAPS = new Set<WaitReason | ListingWaitReason>([
   'lossLimit',
 ]);
 
+/**
+ * The waits a sale into a bid can end: it frees a `maxItems` slot, lowers what is held, and pays
+ * WETH, which the task's balance and `exposureLimit` checks count.
+ */
+const WAITS_A_SALE_ENDS = new Set<WaitReason | ListingWaitReason>([
+  'maxItemsHeld',
+  'maxHeldValue',
+  'insufficientBalance',
+  'exposureLimit',
+]);
+
+/**
+ * The cap a task is held back by: the reason it waits on, or the one its `resaleBid` offer stands
+ * in for, so the exit guards treat a resale offer as the wait it replaces; `undefined` otherwise.
+ */
+const heldBackBy = (state: TaskState) =>
+  state.status === 'waiting' ? state.reason : state.status === 'bidding' ? state.resale : undefined;
+
+/** Whether the task is held back by what the wallet holds or has lost (`HOLDING_CAPS`). */
+const isHeldBackByHolding = (state: TaskState) => {
+  const reason = heldBackBy(state);
+  return reason !== undefined && HOLDING_CAPS.has(reason);
+};
+
+/** Whether the task is held back by a cap a sale into a bid would not end (`WAITS_A_SALE_ENDS`). */
+const isHeldBackPastSale = (state: TaskState) => {
+  const reason = heldBackBy(state);
+  return reason !== undefined && !WAITS_A_SALE_ENDS.has(reason);
+};
+
 const isBidRun = (run: TaskRun): run is TaskRun<BidTask> => run.task.kind !== 'listing';
 const isListingRun = (run: TaskRun): run is TaskRun<ListingTask> => run.task.kind === 'listing';
 
@@ -307,8 +367,9 @@ const isListingRun = (run: TaskRun): run is TaskRun<ListingTask> => run.task.kin
  * into WETH when the bids are short of it (`topUpWeth`).
  *
  * With `lossLimits`, each round first measures the wallet's loss from its fills and emits it as
- * `loss`; while it is at a cap, or cannot be measured, every bid task withdraws its bids and waits
- * (`lossLimit`), and listings run on.
+ * `loss`; while the wallet's is at a cap, or cannot be measured, every bid task withdraws its bids
+ * and waits (`lossLimit`), and while a collection's is at a cap of `perCollection`, its bid tasks
+ * do; listings run on.
  *
  * A failing round leaves the task's bid as it is and is retried on the next round; nothing is
  * placed from a snapshot that could not be read whole. Listing tasks run in the same rounds but
@@ -321,6 +382,10 @@ const isListingRun = (run: TaskRun): run is TaskRun<ListingTask> => run.task.kin
  * A listing task with `openSeaListing` then mirrors each item's GONDI listing on OpenSea at a
  * markup (`decideMirror`), and cancels the OpenSea listings of items it no longer lists; each
  * listing, cancel or failure is emitted as `mirror`, and none of them changes what the item shows.
+ *
+ * A task with `reference` prices against its smoothed price too (`referenceOf`), and a listing
+ * with `aboveCost` against what the item cost, from the same fills as `bidExit`, grossed up for the
+ * collection's royalties and fees.
  *
  * A listing task with `loanOffer`, on a market that lends, then keeps one single-loan offer
  * against each item it lists, priced off the item's GONDI listing (`decideLoanOffer`), so a buyer
@@ -336,6 +401,8 @@ export class Runner extends EventEmitter<RunnerEvents> {
   /** Every fill read since `lossLimits.since`, kept in memory so a round re-reads only the latest. */
   private readonly fillsRead = new Map<string, Fill>();
   private latestFill: Date | undefined;
+  /** Each collection's floor when a loss window started, by `<slug>@<start>`, once its samples are past. */
+  private readonly windowFloorsRead = new Map<string, bigint | null>();
   /** The loss and profit the latest fresh round measured, and when; `undefined` when it could not. */
   private lastMeasured:
     | { loss: Extract<LossReport, { status: 'measured' }>; pnl: PnlReport; at: Date }
@@ -369,6 +436,12 @@ export class Runner extends EventEmitter<RunnerEvents> {
    */
   private readonly listedSince = new Map<string, Date>();
   /**
+   * Each task's smoothed price for its `reference`, by task id: seeded from the market's floor
+   * history the first time, then moved by every price a round reads. In memory only; a restart
+   * seeds it again.
+   */
+  private readonly references = new Map<string, ReferencePrice>();
+  /**
    * Each collection's `ExitOfferRead` this round, by slug, so a `resaleBid` and the `bidExit` that
    * sells what it buys read the offer once between them; emptied at the start of every round.
    */
@@ -399,6 +472,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
       held: null,
       bestCompetingBid: null,
       lowestCompetingAsk: null,
+      targetPrice: null,
       orders: [],
     }));
   }
@@ -445,7 +519,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
       if (isBidRun(run) && !run.task.enabled) await this.countLeftBids(run);
     }
     for (const run of this.runs) {
-      if (run.state.status !== 'halted') await this.advance(run, lossLimitReached(loss));
+      if (run.state.status !== 'halted') await this.advance(run, loss);
     }
     const finishedAt = this.now();
     this.emit('round', {
@@ -561,13 +635,58 @@ export class Runner extends EventEmitter<RunnerEvents> {
         valued.map(async (slug) => [slug, await this.market.saleTerms(slug)] as const),
       ),
     );
-    const loss = lossReport({ ledger, terms, ethUsd, now, limits });
+    const windowFloors = await this.readWindowFloors(carriedCollections(ledger, now), now);
+    const loss = lossReport({ ledger, terms, ethUsd, now, limits, windowFloors });
     const older = tradedCollections(ledger).filter((slug) => !valued.includes(slug));
     const olderTerms = await Promise.allSettled(older.map((slug) => this.market.saleTerms(slug)));
     for (const [index, result] of olderTerms.entries()) {
       if (result.status === 'fulfilled') terms.set(older[index], result.value);
     }
     return { loss, pnl: { ethUsd, collections: pnlOf(ledger, terms) } };
+  }
+
+  /**
+   * Each of `slugs`' floor at the start of `now`'s day and week, which `lossReport` values carried
+   * items against: the largest of the samples `WINDOW_FLOOR_SAMPLE_MS` either side of each start,
+   * up to `now`, so one dust print at the boundary cannot shrink the loss; a larger start only
+   * counts more. A start is cached once all its samples are past. A collection whose read fails is
+   * left out, so its items count against their cost, the whole loss: a failed read never makes the
+   * loss look smaller.
+   */
+  private async readWindowFloors(slugs: string[], now: Date) {
+    const starts = [dayStart(now), weekStart(now)];
+    const samplesOf = (start: Date) =>
+      [-WINDOW_FLOOR_SAMPLE_MS, 0, WINDOW_FLOOR_SAMPLE_MS].map(
+        (offset) => new Date(Math.min(start.getTime() + offset, now.getTime())),
+      );
+    const settled = (start: Date) => start.getTime() + WINDOW_FLOOR_SAMPLE_MS <= now.getTime();
+    const keyOf = (slug: string, start: Date) => `${slug}@${start.getTime()}`;
+    const results = await Promise.allSettled(
+      slugs.map(async (slug) => {
+        const floors = new Map(
+          starts.map((start) => [start.getTime(), this.windowFloorsRead.get(keyOf(slug, start))]),
+        );
+        const missing = starts.filter((start) => floors.get(start.getTime()) === undefined);
+        if (missing.length > 0) {
+          if (!this.market.floorHistory) throw new Error('the market keeps no floor history');
+          const samples = await this.market.floorHistory(slug, missing.flatMap(samplesOf));
+          missing.forEach((start, index) => {
+            const floor = samples
+              .slice(index * 3, index * 3 + 3)
+              .reduce<
+                bigint | null
+              >((largest, sample) => (sample !== null && (largest === null || sample > largest) ? sample : largest), null);
+            floors.set(start.getTime(), floor);
+            if (settled(start)) this.windowFloorsRead.set(keyOf(slug, start), floor);
+          });
+        }
+        const [day, week] = starts.map((start) => floors.get(start.getTime()) ?? null);
+        return [slug, { day, week }] as const;
+      }),
+    );
+    return new Map<string, PerWindow<bigint | null>>(
+      results.flatMap((result) => (result.status === 'fulfilled' ? [result.value] : [])),
+    );
   }
 
   /**
@@ -613,9 +732,9 @@ export class Runner extends EventEmitter<RunnerEvents> {
     }
   }
 
-  private async advance(run: TaskRun, lossLimitReached: boolean) {
+  private async advance(run: TaskRun, loss: LossReport | undefined) {
     try {
-      if (isBidRun(run)) await this.advanceBid(run, lossLimitReached);
+      if (isBidRun(run)) await this.advanceBid(run, loss);
       if (isListingRun(run)) {
         if (run.task.tokenId === undefined) await this.advanceInventory(run);
         else await this.advanceListing(run, run.task.tokenId);
@@ -643,7 +762,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
     }
   }
 
-  private async advanceBid(run: TaskRun<BidTask>, lossLimitReached: boolean) {
+  private async advanceBid(run: TaskRun<BidTask>, loss: LossReport | undefined) {
     const snapshot = await this.market.snapshot(scopeOf(run.task), this.startedAt);
     if (!isCrossed(snapshot.floorPrice, snapshot.bestCompetingBid)) {
       run.referenceFloor ??= snapshot.floorPrice;
@@ -651,17 +770,26 @@ export class Runner extends EventEmitter<RunnerEvents> {
     run.floorPrice = snapshot.floorPrice;
     run.held = snapshot.held;
     run.bestCompetingBid = snapshot.bestCompetingBid;
+    const crossed = isCrossed(snapshot.floorPrice, snapshot.bestCompetingBid);
+    const referencePrice = await this.referenceOf(run.task, crossed ? null : snapshot.floorPrice);
+    run.targetPrice = ladderPrices(run.task, snapshot, referencePrice).at(0) ?? null;
     const input = {
+      referencePrice,
       task: run.task,
       snapshot,
       now: this.now(),
       pollSeconds: this.file.pollSeconds,
       referenceFloor: run.referenceFloor,
       exposureAvailable: this.file.exposureLimit - this.committedByOthers(run),
-      lossLimitReached,
+      lossLimitReached: lossLimitReached(loss, run.task.collection),
     };
     let decision: Decision = reconcile({ ...input, resalePrice: null });
-    if (decision.type === 'wait' && isResaleWait(decision.reason) && run.task.resaleBid) {
+    if (
+      decision.type === 'wait' &&
+      isResaleWait(decision.reason) &&
+      (decision.reason !== 'lossLimit' || freshlyMeasured(loss)) &&
+      run.task.resaleBid
+    ) {
       decision = reconcile({ ...input, resalePrice: await this.resalePriceOf(run, snapshot) });
     }
     const resaleAt = decision.type === 'resale' ? decision.price : null;
@@ -721,8 +849,10 @@ export class Runner extends EventEmitter<RunnerEvents> {
    * every `bidExit`), once that `bidExit` has tried its `maxPerDay` sales today, while the wallet
    * holds more than when a task last kept one up on the collection (`resaleHeldAt`) or more than `maxItems` (an
    * item an earlier offer bought is not sold yet), while another task
-   * keeps one on the collection, when the offer or the gas cannot be read, or when the price does
-   * not fit in what `resaleLimit` has left.
+   * keeps one on the collection, when the offer or the gas cannot be read, when the best other bid
+   * is on the task's own venue (an offer under it there never fills, so a task on the other venue
+   * keeps the collection's resale offer), or when the price does not fit in what `resaleLimit` has
+   * left.
    */
   private async resalePriceOf(run: TaskRun<BidTask>, snapshot: BidSnapshot) {
     const { task } = run;
@@ -747,6 +877,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
     } catch {
       return null;
     }
+    if (read.offer?.venue === task.venue) return null;
     const price = resalePrice({
       ...read,
       maxGasGwei: exit.maxGasGwei,
@@ -792,6 +923,8 @@ export class Runner extends EventEmitter<RunnerEvents> {
     const decision = decideListing({
       task: run.task,
       snapshot,
+      referencePrice: await this.listingReferenceOf(run.task, listingMarket),
+      itemCost: await this.itemCostOf(run.task, tokenId),
       now,
       pollSeconds: this.file.pollSeconds,
       listedSince: this.listedSinceOf(run.task, tokenId, now, snapshot.owned),
@@ -821,6 +954,8 @@ export class Runner extends EventEmitter<RunnerEvents> {
       tokenIds.map((tokenId) => this.market.itemListing({ slug, tokenId }, this.startedAt)),
     );
     run.lowestCompetingAsk = listingMarket.lowestCompetingAsk;
+    const referencePrice = await this.listingReferenceOf(run.task, listingMarket);
+    const feeBps = tokenIds.length > 0 ? await this.feeBpsOf(run.task) : undefined;
     const heldKeys = new Set(tokenIds.map((tokenId) => `${run.task.id}#${tokenId}`));
     for (const key of this.listedSince.keys()) {
       if (key.startsWith(`${run.task.id}#`) && !heldKeys.has(key)) this.listedSince.delete(key);
@@ -858,6 +993,8 @@ export class Runner extends EventEmitter<RunnerEvents> {
         const decision = decideInventoryItem({
           task: run.task,
           snapshot,
+          referencePrice,
+          itemCost: this.itemCost(slug, tokenId, feeBps),
           now,
           pollSeconds: this.file.pollSeconds,
           listedSince: this.listedSinceOf(run.task, tokenId, now, snapshot.owned),
@@ -876,6 +1013,81 @@ export class Runner extends EventEmitter<RunnerEvents> {
     if (loanBook) await this.lendItems(run.task, loanBook, gondiListings, unread);
     run.orders = orders;
     this.update(run, { status: 'listingInventory', items });
+  }
+
+  /**
+   * The task's smoothed price after `sample`, the price this round read (`null` when it read none,
+   * which leaves the price as it was), or `null` for a task without a `reference`. The first time
+   * it is seeded from the collection's floor history over three half-lives, hourly at most, so a
+   * restart does not start it over from today's floor; a trait bid, whose floor is the trait's, a
+   * market without history, or a read that fails, starts it at the first sample instead.
+   */
+  private async referenceOf(task: Task, sample: bigint | null): Promise<bigint | null> {
+    if (!task.reference) return null;
+    const { halfLifeHours } = task.reference;
+    const now = this.now();
+    let reference = this.references.get(task.id);
+    if (!reference && task.kind !== 'traitBid') {
+      reference = await this.seedReference(task.collection, halfLifeHours, now);
+    }
+    if (sample !== null) reference = nextReference(reference, sample, now, halfLifeHours);
+    if (reference) this.references.set(task.id, reference);
+    return reference?.price ?? null;
+  }
+
+  /**
+   * A listing task's `referenceOf` the cheapest competing listing, which a crossed book leaves
+   * out, as a dust ask would otherwise drag the average down.
+   */
+  private async listingReferenceOf(task: ListingTask, market: ListingMarket) {
+    const crossed = isCrossed(market.lowestCompetingAsk, market.bestCompetingBid);
+    return this.referenceOf(task, crossed ? null : market.lowestCompetingAsk);
+  }
+
+  /** The collection's floor history folded into a `ReferencePrice`, or `undefined` without one. */
+  private async seedReference(
+    slug: string,
+    halfLifeHours: number,
+    now: Date,
+  ): Promise<ReferencePrice | undefined> {
+    if (!this.market.floorHistory) return undefined;
+    const spanMs = 3 * halfLifeHours * HOUR_MS;
+    const stepMs = Math.max(HOUR_MS, spanMs / MAX_REFERENCE_SEED_SAMPLES);
+    const timestamps = Array.from(
+      { length: Math.floor(spanMs / stepMs) },
+      (_, index) => new Date(now.getTime() - spanMs + index * stepMs),
+    );
+    try {
+      const floors = await this.market.floorHistory(slug, timestamps);
+      return floors.reduce<ReferencePrice | undefined>(
+        (reference, floor, index) =>
+          floor === null
+            ? reference
+            : nextReference(reference, floor, timestamps[index], halfLifeHours),
+        undefined,
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The royalties and fees a sale of the collection pays, for a listing with `aboveCost`. */
+  private async feeBpsOf(task: ListingTask) {
+    return task.aboveCost ? (await this.market.saleTerms(task.collection)).feeBps : undefined;
+  }
+
+  /** What the item cost and what its sale pays away, when the fills say what it cost. */
+  private itemCost(
+    slug: string,
+    tokenId: bigint,
+    feeBps: bigint | undefined,
+  ): ItemCost | undefined {
+    const position = this.positions.find((held) => held.slug === slug && held.tokenId === tokenId);
+    return position && feeBps !== undefined ? { cost: position.cost, feeBps } : undefined;
+  }
+
+  private async itemCostOf(task: ListingTask, tokenId: bigint) {
+    return this.itemCost(task.collection, tokenId, await this.feeBpsOf(task));
   }
 
   /**
@@ -982,7 +1194,8 @@ export class Runner extends EventEmitter<RunnerEvents> {
     if (!task.loanOffer || !this.market.loans) return undefined;
     try {
       const book = await this.market.loans.loanBook(task.collection);
-      if (book.offers.some((offer) => !offer.hidden)) this.lending.add(task.id);
+      const now = this.now();
+      if (book.offers.some((offer) => isVisibleLoanOffer(offer, now))) this.lending.add(task.id);
       else this.lending.delete(task.id);
       return book;
     } catch (error) {
@@ -1064,9 +1277,9 @@ export class Runner extends EventEmitter<RunnerEvents> {
   /** Hides every visible loan offer of a `loanOffer` task, for `cancelAll`; they lend until they expire. */
   private async hideLoanOffers(task: ListingTask) {
     if (!task.loanOffer || !this.market.loans) return;
-    const now = this.now().getTime();
+    const now = this.now();
     const { offers } = await this.market.loans.loanBook(task.collection);
-    const visible = offers.filter((offer) => !offer.hidden && offer.expiration.getTime() > now);
+    const visible = offers.filter((offer) => isVisibleLoanOffer(offer, now));
     if (visible.length > 0) await this.market.loans.hideLoanOffers(visible);
     this.lending.delete(task.id);
   }
@@ -1143,7 +1356,7 @@ export class Runner extends EventEmitter<RunnerEvents> {
         (position) => position.slug === scope.slug && position.tokenId === scope.tokenId,
       ),
       ...exitMarket,
-      ownTopBid: this.ownTopBid(task.collection),
+      ownTopBid: this.ownTopBid(task.collection, held),
       bidsFull: this.bidsFull(task.collection, held),
       soldToday: this.exitsByDay.get(dayKey) ?? 0,
       now,
@@ -1180,8 +1393,9 @@ export class Runner extends EventEmitter<RunnerEvents> {
   /**
    * Whether no bid task on the collection can buy another item, so a held one may be sold at a
    * loss. A task cannot buy once it is halted (disabled, `filled`, `floorMoved`, cancelled), while it
-   * waits on what it holds or has lost (`HOLDING_CAPS`), or once `held` items reach its `maxItems`;
-   * a collection with no bid task cannot buy either. A wait on balance, allowance or exposure passes,
+   * waits on what it holds or has lost (`HOLDING_CAPS`), or keeps a `resaleBid` offer in place of
+   * such a wait (`heldBackBy`), or once `held` items reach its `maxItems`; a collection with no bid
+   * task cannot buy either. A wait on balance, allowance or exposure passes,
    * so it does not count.
    */
   private bidsFull(slug: string, held: number) {
@@ -1191,21 +1405,33 @@ export class Runner extends EventEmitter<RunnerEvents> {
       .some(
         (run) =>
           run.state.status !== 'halted' &&
-          !(run.state.status === 'waiting' && HOLDING_CAPS.has(run.state.reason)) &&
+          !isHeldBackByHolding(run.state) &&
           (run.task.maxItems === undefined || held < run.task.maxItems),
       );
   }
 
-  /** The highest price the bid tasks' live bids on the collection offer, on any venue. */
-  private ownTopBid(slug: string) {
-    return this.runs
-      .filter(isBidRun)
-      .filter((run) => run.task.collection === slug)
-      .flatMap((run) => run.orders)
-      .reduce<bigint | null>(
-        (top, order) => (top === null || order.price > top ? order.price : top),
-        null,
-      );
+  /**
+   * The most the bid tasks on the collection pay for an item, on any venue, now or once a sale
+   * makes room: their live bids, and the `targetPrice` of each task that bids, or waits only on
+   * what the sale ends (`WAITS_A_SALE_ENDS`), as long as one fewer than `held` items is under its
+   * `maxItems`. A task waiting on `maxItemsHeld` has withdrawn its bids, bids its target price
+   * again the round after a sale, and a seller could hand the same item straight back into it. A
+   * halted task, one waiting on what a sale leaves as it is (`lossLimit`, allowance, a crossed
+   * book), and one still at its `maxItems` after the sale stay out.
+   */
+  private ownTopBid(slug: string, held: number) {
+    const runs = this.runs.filter(isBidRun).filter((run) => run.task.collection === slug);
+    const targets = runs
+      .filter(
+        (run) =>
+          run.state.status !== 'halted' &&
+          !isHeldBackPastSale(run.state) &&
+          (run.task.maxItems === undefined || held - 1 < run.task.maxItems),
+      )
+      .flatMap((run) => (run.targetPrice === null ? [] : [run.targetPrice]));
+    return [...runs.flatMap((run) => run.orders.map((order) => order.price)), ...targets].reduce<
+      bigint | null
+    >((top, price) => (top === null || price > top ? price : top), null);
   }
 
   /**

@@ -5,6 +5,7 @@ import {
   type Hash,
   isAddressEqual,
   parseAbi,
+  parseEther,
   zeroAddress,
   zeroHash,
 } from 'viem';
@@ -67,6 +68,8 @@ const CLOSED_STATUSES: OrderStatus[] = ['Executed', 'Cancelled', 'Expired'];
 const MAX_CANCELS_PER_CALL = 50;
 /** The most orders the API serves in one page of the competing bid book. */
 const BOOK_PAGE = 20;
+/** The most `floorPriceAt` samples one floor history read asks for. */
+const FLOOR_HISTORY_BATCH = 24;
 /** The most pages of the book one snapshot reads looking for its levels: 500 bids. */
 const MAX_BOOK_PAGES = 25;
 /** How far back past the previous read a closed-bid read starts, for clock drift with the API. */
@@ -172,11 +175,11 @@ export const approvalOperator = async (gondi: Gondi, conduitKey: Hash) => {
 };
 
 /**
- * Each price in `orders`, stepped where the API steps it, once, best first: the competing price
- * levels `level` pricing joins.
+ * Each price in `orders`, once, best first: the competing price levels `level` pricing joins. The
+ * API ranks bids on their raw price, so each distinct price is a level of its own.
  */
 export const bidLevels = (orders: ApiOrder[]) =>
-  [...new Set(orders.map((order) => order.steppedPrice ?? order.price))].sort((first, second) =>
+  [...new Set(orders.map((order) => order.price))].sort((first, second) =>
     first > second ? -1 : first < second ? 1 : 0,
   );
 
@@ -386,8 +389,8 @@ export class GondiMarket implements Market, LoanVenue {
     if (ownBook.traitId !== undefined && scope.kind === 'trait') {
       this.traitIds.set(traitKey(scope.slug, scope.trait), ownBook.traitId);
     }
-    const [competingBidLevels, ownBids, priceStep, held, balance, allowance] = await Promise.all([
-      this.competingBidLevels(priceBook.competing, scope.levels ?? 1),
+    const [competing, ownBids, priceStep, held, balance, allowance] = await Promise.all([
+      this.competingBook(priceBook.competing, scope.levels ?? 1),
       this.ownBids(ownBook, since),
       this.priceStep(market.collectionId),
       this.held(scope, market.contractAddress),
@@ -396,8 +399,9 @@ export class GondiMarket implements Market, LoanVenue {
     ]);
     return {
       floorPrice: priceBook.floorPrice,
-      bestCompetingBid: competingBidLevels[0] ?? null,
-      competingBidLevels,
+      bestCompetingBid: competing.levels[0] ?? null,
+      bestCompetingBidOnGondi: competing.bestOnGondi,
+      competingBidLevels: competing.levels,
       ownBids,
       priceStep,
       held,
@@ -498,7 +502,7 @@ export class GondiMarket implements Market, LoanVenue {
       royalties: market.royalties,
     });
     const prices = await this.priceMarket(slug, market);
-    const [lowestCompetingAsk, bestCompetingBid, approved] = await Promise.all([
+    const [lowestAsk, bestCompetingBid, approved] = await Promise.all([
       this.lowestCompetingAsk(prices.collectionId),
       this.bestCompetingBid(prices.collectionId),
       this.gondi.isApprovedNFTForAll({
@@ -507,7 +511,12 @@ export class GondiMarket implements Market, LoanVenue {
         to: operator,
       }),
     ]);
-    return { lowestCompetingAsk, bestCompetingBid, approved };
+    return {
+      lowestCompetingAsk: lowestAsk?.price ?? null,
+      lowestCompetingAskOnGondi: lowestAsk?.marketPlace === NATIVE_MARKETPLACE,
+      bestCompetingBid,
+      approved,
+    };
   }
 
   /**
@@ -665,6 +674,22 @@ export class GondiMarket implements Market, LoanVenue {
     return this.priceApi.currencyUsdPrice(WETH);
   }
 
+  /**
+   * The collection's floor at each of `timestamps`, read a few dozen at a time. A price replay
+   * keeps no history to read, so it throws, and a `reference` starts from the first floor a round
+   * reads.
+   */
+  async floorHistory(slug: string, timestamps: Date[]) {
+    if (this.priceApi !== this.api) throw new Error('a price replay keeps no floor history');
+    const floors: (bigint | null)[] = [];
+    for (let start = 0; start < timestamps.length; start += FLOOR_HISTORY_BATCH) {
+      const batch = timestamps.slice(start, start + FLOOR_HISTORY_BATCH);
+      const read = await this.api.floorPricesAt({ slug, timestamps: batch });
+      floors.push(...read.map((floor) => (floor === null ? null : parseEther(floor.toFixed(9)))));
+    }
+    return floors;
+  }
+
   /** The collection as `listingMarket` last read it. */
   private listingCollection(slug: string) {
     const collection = this.listingCollections.get(slug);
@@ -742,7 +767,7 @@ export class GondiMarket implements Market, LoanVenue {
       sortBy: [{ field: 'PRICE', order: 'ASC' }],
       limit: 1,
     });
-    return orders[0]?.price ?? null;
+    return orders.at(0);
   }
 
   private async ownListings(scope: ListingScope, collectionId: number, since: Date) {
@@ -762,8 +787,8 @@ export class GondiMarket implements Market, LoanVenue {
   }
 
   private async bestCompetingBid(collectionId: number) {
-    const [best] = await this.competingBidLevels([collectionBook(collectionId)], 1);
-    return best ?? null;
+    const { levels } = await this.competingBook([collectionBook(collectionId)], 1);
+    return levels[0] ?? null;
   }
 
   /**
@@ -844,12 +869,18 @@ export class GondiMarket implements Market, LoanVenue {
 
   /**
    * The best `levels` competing price levels of the WETH bids `books` select together, best first,
-   * the wallet's own excluded. The best `levels` of their union are among the best `levels` of each
+   * the wallet's own excluded, and whether a GONDI bid holds the best of them. The best `levels` of their union are among the best `levels` of each
    * book, so each is read on its own (`bookOrders`) and the reads merged.
    */
-  private async competingBidLevels(books: BookFilter[], levels: number) {
-    const reads = await Promise.all(books.map((book) => this.bookOrders(book, levels)));
-    return bidLevels(reads.flat()).slice(0, levels);
+  private async competingBook(books: BookFilter[], levels: number) {
+    const orders = (await Promise.all(books.map((book) => this.bookOrders(book, levels)))).flat();
+    const best = bidLevels(orders).slice(0, levels);
+    return {
+      levels: best,
+      bestOnGondi: orders.some(
+        (order) => order.price === best[0] && order.marketPlace === NATIVE_MARKETPLACE,
+      ),
+    };
   }
 
   /**

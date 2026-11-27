@@ -15,8 +15,11 @@ export type WaitReason =
   | 'lossLimit'
   | 'crossedBook';
 
-/** The waits a `resaleBid` offer stands in for: the caps on what the wallet holds or commits. */
-const RESALE_WAITS = ['maxItemsHeld', 'maxHeldValue', 'exposureLimit'] as const;
+/**
+ * The waits a `resaleBid` offer stands in for: the caps on what the wallet holds, commits or has
+ * lost. The runner offers no resale price at a loss cap whose loss it could not measure.
+ */
+const RESALE_WAITS = ['maxItemsHeld', 'maxHeldValue', 'exposureLimit', 'lossLimit'] as const;
 export type ResaleWaitReason = (typeof RESALE_WAITS)[number];
 
 /** Whether a `resaleBid` offer may stand in for a wait on `reason`. */
@@ -50,13 +53,15 @@ export type ReconcileInput = {
   referenceFloor: bigint | null;
   /** How much the task's bid may commit, after every other task's live bid. */
   exposureAvailable: bigint;
-  /** Whether the wallet's loss reached a cap of `lossLimits`, or could not be measured. */
+  /** Whether the wallet's or the task's collection's loss reached a cap of `lossLimits`, or could not be measured. */
   lossLimitReached: boolean;
   /**
    * The price of the task's `resaleBid` offer this round (see `resalePrice`), or `null` when it
    * keeps none: no `resaleBid`, no price, or no room left under `resaleLimit`.
    */
   resalePrice: bigint | null;
+  /** The task's smoothed floor, which caps the bid with a `reference`; `null` without one. */
+  referencePrice?: bigint | null;
 };
 
 const floorMoved = (task: BidTask, floor: bigint | null, referenceFloor: bigint | null) => {
@@ -167,7 +172,7 @@ const bidDecision = (
  * the decision out. Buying the whole `quantity` or a floor move halts the task; with `maxItems` or
  * `maxHeldValue` a fill does not, and the task withdraws its bid only while the wallet holds that
  * many items, or items worth that much at the floor with no room for one more at the bid, and
- * while the wallet's loss is at a cap of `lossLimits` (`lossLimitReached`), or while the floor sits
+ * while the loss is at a cap of `lossLimits` for the task's collection (`lossLimitReached`), or while the floor sits
  * under the best competing bid (`crossedBook`), as a dust floor would have it value held items at
  * nothing and cap the bid at nothing; a crossed floor never counts as a floor move. A bid
  * that cannot be priced or paid for is withdrawn rather than left at a stale price; otherwise the
@@ -178,7 +183,7 @@ const bidDecision = (
  * task places nothing beside it, and a wait cancels only the bids it can, so a later round
  * withdraws the rest.
  * A halt still names every active bid, since a halted task gets no later round to withdraw them.
- * With a `resalePrice`, a wait on what the wallet holds or commits (`RESALE_WAITS`) keeps one offer
+ * With a `resalePrice`, a wait on what the wallet holds, commits or has lost (`RESALE_WAITS`) keeps one offer
  * for one item at that price instead (`resale`), when the wallet's WETH and allowance cover it.
  */
 export const reconcile = (input: ReconcileInput): Decision => {
@@ -203,6 +208,7 @@ const reconcileBids = ({
   referenceFloor,
   exposureAvailable,
   lossLimitReached,
+  referencePrice = null,
 }: ReconcileInput): Decision => {
   const activeBids = snapshot.ownBids.filter((bid) => bid.active);
   const withdrawable = cancellableAt(activeBids, now);
@@ -218,7 +224,7 @@ const reconcileBids = ({
   }
   if (lossLimitReached) return { type: 'wait', reason: 'lossLimit', cancel: withdrawable };
   if (wanted <= 0) return { type: 'wait', reason: 'maxItemsHeld', cancel: withdrawable };
-  const prices = ladderPrices(task, snapshot);
+  const prices = ladderPrices(task, snapshot, referencePrice);
   const price = prices.at(0) ?? null;
   const quantity =
     price === null || task.maxHeldValue === undefined

@@ -1,7 +1,7 @@
 import { formatEther } from 'viem';
 
 import { VENUE_NAMES } from './market';
-import type { LossReport } from './pnl';
+import type { CollectionLoss, LossReport } from './pnl';
 import type { ExitReport, LendReport, MirrorReport, TaskState, WrapReport } from './runner';
 
 /** A task's state in one line, for the CLI log and the desktop task list. */
@@ -39,6 +39,15 @@ export const describeTaskState = (state: TaskState) => {
 
 const usd = (amount: number) => `$${amount.toFixed(2)}`;
 
+const eth = (wei: bigint) => `${Number(formatEther(wei)).toFixed(4)} ETH`;
+
+/** One collection's loss against its caps, such as `bayc (today 0.1500 of 0.0900 ETH, …)`. */
+const describeCollectionLoss = (loss: CollectionLoss) => {
+  const windowLoss = (name: string, amount: bigint, limit: bigint | null) =>
+    limit === null ? `${name} ${eth(amount)}, no floor` : `${name} ${eth(amount)} of ${eth(limit)}`;
+  return `${loss.slug} (${windowLoss('today', loss.dailyLoss, loss.dailyLimit)}, ${windowLoss('this week', loss.weeklyLoss, loss.weeklyLimit)})`;
+};
+
 /** A round's loss against `lossLimits` in one line, for the CLI log and the desktop window. */
 export const describeLoss = (report: LossReport) => {
   if (report.status === 'unmeasured') return `loss unmeasured, not bidding: ${report.reason}`;
@@ -46,7 +55,13 @@ export const describeLoss = (report: LossReport) => {
   const stale = report.staleReason
     ? ` (as last measured; this read failed: ${report.staleReason})`
     : '';
-  return `${report.reached ? `${loss}, at a cap: not bidding` : loss}${stale}`;
+  if (report.reached) return `${loss}, at a cap: not bidding${stale}`;
+  const stopped = report.collections.filter((collection) => collection.reached);
+  const collections =
+    stopped.length === 0
+      ? ''
+      : `; at a cap, not bidding on ${stopped.map(describeCollectionLoss).join(', ')}`;
+  return `${loss}${collections}${stale}`;
 };
 
 /** A round's `wrapEth` top-up in one line, for the CLI log. */

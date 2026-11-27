@@ -1,6 +1,6 @@
 import { formatEther } from 'viem';
 
-import { BPS } from './basisPoints';
+import { BPS, percentOf } from './basisPoints';
 import type { Fill, SaleTerms } from './market';
 import type { LossLimits } from './task';
 
@@ -9,19 +9,44 @@ const DAY_MS = 24 * 60 * 60_000;
 /** An item the wallet bought since `since` and has not sold since, and when it bought it. */
 export type Position = { slug: string; tokenId: bigint; cost: bigint; boughtAt: Date };
 
-/** A sale of an item the wallet bought since `since`, beside what it paid for it. */
-export type ClosedSale = { slug: string; price: bigint; cost: bigint; timestamp: Date };
+/** A sale of an item the wallet bought since `since`, beside what it paid for it and when. */
+export type ClosedSale = {
+  slug: string;
+  price: bigint;
+  cost: bigint;
+  boughtAt: Date;
+  timestamp: Date;
+};
 
 /** The wallet's trades since `since`: what it still holds and what it sold, each with its cost. */
 export type Ledger = { positions: Position[]; sales: ClosedSale[] };
 
-/** The loss over the UTC day and the ISO week, in USD, or why it could not be measured. */
+/**
+ * One collection's loss over the UTC day and the ISO week, in wei, against its caps of
+ * `lossLimits.perCollection` (`null` without them, or with neither a floor nor a minimum).
+ */
+export type CollectionLoss = {
+  slug: string;
+  dailyLoss: bigint;
+  weeklyLoss: bigint;
+  dailyLimit: bigint | null;
+  weeklyLimit: bigint | null;
+  /** Whether its bid tasks stop: a loss at a cap, or a loss with no floor to set the caps. */
+  reached: boolean;
+};
+
+/**
+ * The loss over the UTC day and the ISO week, in USD for the wallet and in wei for each collection
+ * it traded this week, or why it could not be measured.
+ */
 export type LossReport =
   | {
       status: 'measured';
       dailyLossUsd: number;
       weeklyLossUsd: number;
+      /** Whether the wallet's loss is at a cap of `dailyUsd` or `weeklyUsd`: every bid stops. */
       reached: boolean;
+      collections: CollectionLoss[];
       /** Why this round's read failed, when the loss is the one an earlier round measured. */
       staleReason?: string;
     }
@@ -65,6 +90,7 @@ export const ledgerOf = (fills: Fill[], since: Date): Ledger => {
       slug: fill.slug,
       price: fill.price,
       cost: position.cost,
+      boughtAt: position.boughtAt,
       timestamp: fill.timestamp,
     });
     open.delete(key);
@@ -84,6 +110,18 @@ export const valuedCollections = (ledger: Ledger, now: Date) =>
     ledger.sales.filter((sale) => sale.timestamp >= weekStart(now)),
   );
 
+/**
+ * The collections whose window floors `lossReport` would use: those of an item held, or sold this
+ * week, that the wallet bought before today began.
+ */
+export const carriedCollections = (ledger: Ledger, now: Date) => {
+  const today = dayStart(now);
+  return slugsOf(
+    ledger.positions.filter((position) => position.boughtAt < today),
+    ledger.sales.filter((sale) => sale.timestamp >= weekStart(now) && sale.boughtAt < today),
+  );
+};
+
 /** Every collection the ledger traded, which the P&L values: `valuedCollections` and older sales. */
 export const tradedCollections = (ledger: Ledger) => slugsOf(ledger.positions, ledger.sales);
 
@@ -97,52 +135,149 @@ const saleProfit = (sale: ClosedSale, feeBps: bigint) => netOf(sale.price, feeBp
 const heldProfit = (position: Position, floorPrice: bigint, feeBps: bigint) =>
   netOf(floorPrice, feeBps) - position.cost;
 
+/** The loss windows: the UTC day and the ISO week. */
+type Window = 'day' | 'week';
+
+/** Each window's value of one thing, such as its floor when the window started. */
+export type PerWindow<Value> = Record<Window, Value>;
+
+/** When each window of `now` started. */
+const windowStarts = (now: Date): PerWindow<Date> => ({ day: dayStart(now), week: weekStart(now) });
+
 /**
- * A held item's `heldProfit`, never above zero: the floor can be the wallet's own listing, so a
- * paper gain would offset realized losses that nobody has paid to cover.
+ * What an item counts as worth when a window starts: its cost when bought in the window, or with
+ * no floor of that moment; otherwise selling it at that floor, net of fees, but never more than it
+ * cost, so a paper gain that fades in the window is no loss. So what it lost before the window is
+ * left out, and a carried loss does not block the next day.
  */
-const positionProfit = (position: Position, floorPrice: bigint, feeBps: bigint) => {
-  const profit = heldProfit(position, floorPrice, feeBps);
-  return profit < 0n ? profit : 0n;
+const startValue = (
+  item: { cost: bigint; boughtAt: Date },
+  start: Date,
+  startFloor: bigint | null | undefined,
+  feeBps: bigint,
+) => {
+  if (item.boughtAt >= start || startFloor === null || startFloor === undefined) return item.cost;
+  const value = netOf(startFloor, feeBps);
+  return value < item.cost ? value : item.cost;
 };
 
 /** A loss in wei as USD, or 0 when `lossWei` is a gain. */
 const lossUsd = (lossWei: bigint, ethUsd: number) =>
   lossWei > 0n ? Number(formatEther(lossWei)) * ethUsd : 0;
 
+/** What a held item or a sale this week made in each window, in wei, by collection. */
+type Valued = { slug: string; profit: PerWindow<bigint> };
+
 /**
- * What every item still held would lose at the floor today, and what each sale since the start
- * of the week made, or why one of them cannot be valued.
+ * What every item still held lost in each window at the floor today, never a gain, since the floor
+ * can be the wallet's own listing, and what each sale in a window made in it, both against the
+ * item's `startValue` with `windowFloors`, or why one of them cannot be valued.
  */
 const valuation = (
   ledger: Ledger,
   terms: Map<string, SaleTerms>,
+  windowFloors: Map<string, PerWindow<bigint | null>>,
   now: Date,
-): { reason: string } | { unrealized: bigint; sales: { profit: bigint; timestamp: Date }[] } => {
-  let unrealized = 0n;
+): { reason: string } | { valued: Valued[] } => {
+  const starts = windowStarts(now);
+  const valued: Valued[] = [];
   for (const position of ledger.positions) {
     const positionTerms = terms.get(position.slug);
     if (!positionTerms || positionTerms.floorPrice === null) {
       return { reason: `no floor for ${position.slug}` };
     }
-    unrealized += positionProfit(position, positionTerms.floorPrice, positionTerms.feeBps);
+    const { floorPrice, feeBps } = positionTerms;
+    const heldIn = (window: Window) => {
+      const start = startValue(
+        position,
+        starts[window],
+        windowFloors.get(position.slug)?.[window],
+        feeBps,
+      );
+      const profit = netOf(floorPrice, feeBps) - start;
+      return profit < 0n ? profit : 0n;
+    };
+    valued.push({ slug: position.slug, profit: { day: heldIn('day'), week: heldIn('week') } });
   }
-  const sales: { profit: bigint; timestamp: Date }[] = [];
-  for (const sale of ledger.sales.filter((sale) => sale.timestamp >= weekStart(now))) {
+  for (const sale of ledger.sales.filter((sale) => sale.timestamp >= starts.week)) {
     const saleTerms = terms.get(sale.slug);
     if (!saleTerms) return { reason: `no sale terms for ${sale.slug}` };
-    sales.push({ profit: saleProfit(sale, saleTerms.feeBps), timestamp: sale.timestamp });
+    const soldIn = (window: Window) =>
+      sale.timestamp < starts[window]
+        ? 0n
+        : netOf(sale.price, saleTerms.feeBps) -
+          startValue(sale, starts[window], windowFloors.get(sale.slug)?.[window], saleTerms.feeBps);
+    valued.push({ slug: sale.slug, profit: { day: soldIn('day'), week: soldIn('week') } });
   }
-  return { unrealized, sales };
+  return { valued };
+};
+
+/** The loss of `valued` in `window`, in wei: what it lost, or 0 when it gained. */
+const lossIn = (valued: Valued[], window: Window) => {
+  const profit = valued.reduce((total, entry) => total + entry.profit[window], 0n);
+  return profit < 0n ? -profit : 0n;
 };
 
 /**
- * The wallet's loss over `now`'s UTC day and ISO week, against `limits`. Each window's profit is
- * what its sales made, net of fees, plus what every item still held would lose at the floor today,
- * net of fees too;
- * a held item counts in both windows, so one held underwater blocks bidding until it sells or
- * recovers. Unmeasured when a held item has no floor or a sale's collection no terms: the caller
- * treats that as the cap being reached.
+ * A collection's cap: `percent` of `floorPrice` or `minimum`, whichever is larger, in wei; only
+ * `minimum` without a floor, and `null` with neither.
+ */
+const capOf = (floorPrice: bigint | null, percent: number, minimum: bigint | undefined) => {
+  const share = floorPrice === null ? null : percentOf(floorPrice, percent);
+  if (minimum === undefined) return share;
+  return share === null || share < minimum ? minimum : share;
+};
+
+/** Whether `loss` reached `limit`; a loss with no limit to hold it to counts as reached. */
+const atLimit = (loss: bigint, limit: bigint | null) =>
+  loss > 0n && (limit === null || loss >= limit);
+
+/**
+ * Each collection's loss in `valued`, against its caps (`capOf`) from its floor in `terms`. Without
+ * `perCollection` its limits are `null` and it never counts as reached.
+ */
+const collectionLosses = (
+  valued: Valued[],
+  terms: Map<string, SaleTerms>,
+  perCollection: LossLimits['perCollection'],
+): CollectionLoss[] =>
+  [...new Set(valued.map((entry) => entry.slug))].map((slug) => {
+    const entries = valued.filter((entry) => entry.slug === slug);
+    const dailyLoss = lossIn(entries, 'day');
+    const weeklyLoss = lossIn(entries, 'week');
+    if (!perCollection) {
+      return { slug, dailyLoss, weeklyLoss, dailyLimit: null, weeklyLimit: null, reached: false };
+    }
+    const floorPrice = terms.get(slug)?.floorPrice ?? null;
+    const dailyLimit = capOf(
+      floorPrice,
+      perCollection.dailyFloorPercent,
+      perCollection.minDailyEth,
+    );
+    const weeklyLimit = capOf(
+      floorPrice,
+      perCollection.weeklyFloorPercent,
+      perCollection.minWeeklyEth,
+    );
+    return {
+      slug,
+      dailyLoss,
+      weeklyLoss,
+      dailyLimit,
+      weeklyLimit,
+      reached: atLimit(dailyLoss, dailyLimit) || atLimit(weeklyLoss, weeklyLimit),
+    };
+  });
+
+/**
+ * The wallet's loss over `now`'s UTC day and ISO week, against `limits`, and each collection's.
+ * Each window counts only what was lost in it: what its sales made, net of fees, plus what every
+ * item still held would lose at the floor today, net of fees too, each against what the item was
+ * worth when the window started (`startValue`, from `windowFloors`, each collection's floor at
+ * the start of the day and of the week). An item bought earlier and still underwater counts only
+ * its further fall, so a loss carried from yesterday does not stop today's bids; without its
+ * window floor it counts against its cost, the whole loss. Unmeasured when a held item has no
+ * floor or a sale's collection no terms: the caller treats that as every cap being reached.
  */
 export const lossReport = ({
   ledger,
@@ -150,29 +285,27 @@ export const lossReport = ({
   ethUsd,
   now,
   limits,
+  windowFloors = new Map(),
 }: {
   ledger: Ledger;
   terms: Map<string, SaleTerms>;
   ethUsd: number;
   now: Date;
   limits: LossLimits;
+  windowFloors?: Map<string, PerWindow<bigint | null>>;
 }): LossReport => {
-  const valued = valuation(ledger, terms, now);
-  if ('reason' in valued) return { status: 'unmeasured', reason: valued.reason };
-  const lossSinceUsd = (start: Date) =>
-    lossUsd(
-      -valued.sales
-        .filter((sale) => sale.timestamp >= start)
-        .reduce((total, sale) => total + sale.profit, valued.unrealized),
-      ethUsd,
-    );
-  const dailyLossUsd = lossSinceUsd(dayStart(now));
-  const weeklyLossUsd = lossSinceUsd(weekStart(now));
+  const result = valuation(ledger, terms, windowFloors, now);
+  if ('reason' in result) return { status: 'unmeasured', reason: result.reason };
+  const dailyLossUsd = lossUsd(lossIn(result.valued, 'day'), ethUsd);
+  const weeklyLossUsd = lossUsd(lossIn(result.valued, 'week'), ethUsd);
   return {
     status: 'measured',
     dailyLossUsd,
     weeklyLossUsd,
-    reached: dailyLossUsd >= limits.dailyUsd || weeklyLossUsd >= limits.weeklyUsd,
+    reached:
+      (limits.dailyUsd !== undefined && dailyLossUsd >= limits.dailyUsd) ||
+      (limits.weeklyUsd !== undefined && weeklyLossUsd >= limits.weeklyUsd),
+    collections: collectionLosses(result.valued, terms, limits.perCollection),
   };
 };
 

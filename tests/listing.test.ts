@@ -6,7 +6,15 @@ import {
   type DecideListingInput,
   targetListingPrice,
 } from '../src/engine/listing';
-import { eth, listingOf, listingSnapshotOf, listingTaskOf } from './fakeMarket';
+import type { ListingTask } from '../src/engine/task';
+import {
+  eth,
+  listingOf,
+  listingSnapshotOf,
+  listingTaskJson,
+  listingTaskOf,
+  tasksFileOf,
+} from './fakeMarket';
 
 const NOW = new Date('2030-01-01T00:00:00Z');
 
@@ -56,6 +64,41 @@ describe('targetListingPrice', () => {
   test('caps a fixed price at the maximum', () => {
     const task = listingTaskOf({ pricing: { mode: 'fixed', price: '20' } });
     expect(targetListingPrice(task, listingSnapshotOf(), NOW, NOW)).toBe(eth('12'));
+  });
+});
+
+describe('targetListingPrice safeguards', () => {
+  const floorTask = (overrides: object = {}) =>
+    tasksFileOf([listingTaskJson({ pricing: { mode: 'floor', percent: 99.5 }, ...overrides })], {
+      lossLimits: { dailyUsd: 400, since: '2030-01-01T00:00:00Z' },
+    }).tasks[0] as ListingTask;
+  const price = (task: ListingTask, bounds: object, snapshot = {}) =>
+    targetListingPrice(task, listingSnapshotOf(snapshot), NOW, NOW, bounds);
+
+  test.each([
+    ['at the rule price above the break-even', '9', '0', '9.95'],
+    ['at the break-even when the rule is under it', '10', '0', '10.050251256281407036'],
+    ['at the break-even plus the margin', '10', '1', '10.150753768844221106'],
+    ['at the break-even even above maxPrice', '12', '0', '12.060301507537688443'],
+  ])('lists %s', (_case, cost, marginPercent, expected) => {
+    const task = floorTask({ aboveCost: { marginPercent: Number(marginPercent) } });
+    expect(price(task, { itemCost: { cost: eth(cost), feeBps: 50n } })).toBe(eth(expected));
+  });
+
+  test('lists at the rule price when the fills do not say what the item cost', () => {
+    expect(price(floorTask({ aboveCost: {} }), {})).toBe(eth('9.95'));
+  });
+
+  test('never lists more than maxBelowPercent under the reference price', () => {
+    const task = floorTask({ reference: { maxBelowPercent: 1 } });
+    expect(price(task, { referencePrice: eth('10.5') })).toBe(eth('10.395'));
+    expect(price(task, { referencePrice: eth('10') })).toBe(eth('9.95'));
+  });
+
+  test('sits percent above the cheapest competing listing when it is on GONDI', () => {
+    const task = floorTask({ behindGondi: { percent: 1 } });
+    expect(price(task, {}, { lowestCompetingAskOnGondi: true })).toBe(eth('10.1'));
+    expect(price(task, {}, { lowestCompetingAskOnGondi: false })).toBe(eth('9.95'));
   });
 });
 

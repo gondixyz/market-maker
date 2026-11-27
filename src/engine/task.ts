@@ -121,6 +121,27 @@ const tokenId = z
   .regex(/^\d+$/, 'expected a token id such as "3950"')
   .transform((value) => BigInt(value));
 
+/**
+ * The smoothed price a task keeps beside the market's: an exponential moving average of the floor,
+ * which halves its distance to a new floor every `halfLifeHours`. The bot seeds it from the
+ * collection's floor history when it starts, so a restart keeps it. See `nextReference`.
+ */
+const referenceFields = {
+  halfLifeHours: z
+    .number()
+    .positive()
+    .max(24 * 30)
+    .default(24),
+};
+
+/**
+ * When another wallet's best price on the task's own side of the book (the best competing bid
+ * for a bid, the cheapest competing listing for a listing) is on GONDI, sit `percent` behind it
+ * rather than at it or past it, so the task is not the first order a GONDI taker hits. Off when
+ * omitted.
+ */
+const behindGondi = z.object({ percent: z.number().positive().max(100).default(1) }).optional();
+
 const taskFields = {
   id: z.string().min(1),
   /** A disabled task stays in the file but does not run: it places nothing and stays `halted`. */
@@ -179,6 +200,15 @@ const bidFields = {
    * see `resalePrice`.
    */
   resaleBid: z.object({ marginPercent: z.number().positive().max(100).default(2) }).optional(),
+  /**
+   * Never bid above `belowPercent` under the smoothed floor (`referenceFields`), so a floor that
+   * jumps up does not pull the bid up with it at once. Off when omitted.
+   */
+  reference: z
+    .object({ ...referenceFields, belowPercent: z.number().nonnegative().max(100).default(2) })
+    .optional(),
+  /** Never bid above the best competing bid when that bid is on GONDI: sit `percent` under it. */
+  behindGondi,
 };
 
 const task = z
@@ -250,6 +280,30 @@ const task = z
         })
         .optional(),
       /**
+       * Never list an item for less than it cost, plus `marginPercent`, once the sale's royalties
+       * and fees are paid. What it cost comes from the fills `lossLimits` reads, so an item bought
+       * before `lossLimits.since` has no such floor. Off when omitted.
+       */
+      aboveCost: z
+        .object({ marginPercent: z.number().nonnegative().max(100).default(0) })
+        .optional(),
+      /**
+       * Never list more than `maxBelowPercent` under the smoothed cheapest competing listing
+       * (`referenceFields`), so a sudden dip does not pull the listing down with it. Off when
+       * omitted.
+       */
+      reference: z
+        .object({
+          ...referenceFields,
+          maxBelowPercent: z.number().nonnegative().max(100).default(1),
+        })
+        .optional(),
+      /**
+       * Never list under the cheapest competing listing when that listing is on GONDI: sit
+       * `percent` above it.
+       */
+      behindGondi,
+      /**
        * Also offer a loan against each listed item, `principalPercent` of its GONDI listing price,
        * so a buyer can buy it now and pay later: the loan pays most of the price, the buyer the
        * rest, and a default returns the item to the wallet. One single-loan offer per item, signed
@@ -305,13 +359,37 @@ const task = z
     },
   );
 
-/** Stop bidding once the loss over the UTC day or the ISO week reaches these many USD. */
-const lossLimits = z.object({
-  dailyUsd: z.number().positive(),
-  weeklyUsd: z.number().positive(),
-  /** Where the ledger starts: fills before it never count. */
-  since: z.iso.datetime({ offset: true }).transform((value) => new Date(value)),
-});
+/**
+ * Stop bidding once the loss over the UTC day or the ISO week reaches a cap: the wallet's in USD
+ * (`dailyUsd`, `weeklyUsd`), which stops every bid task, or each collection's as a percent of its
+ * floor (`perCollection`), which stops only that collection's bid tasks. At least one cap is set.
+ */
+const lossLimits = z
+  .object({
+    dailyUsd: z.number().positive().optional(),
+    weeklyUsd: z.number().positive().optional(),
+    perCollection: z
+      .object({
+        dailyFloorPercent: z.number().positive().max(100),
+        weeklyFloorPercent: z.number().positive().max(100),
+        /**
+         * The least each cap may be, in ETH, so a cheap collection gets more of its floor than an
+         * expensive one: a cap is the larger of the percent of the floor and this.
+         */
+        minDailyEth: ether.optional(),
+        minWeeklyEth: ether.optional(),
+      })
+      .optional(),
+    /** Where the ledger starts: fills before it never count. */
+    since: z.iso.datetime({ offset: true }).transform((value) => new Date(value)),
+  })
+  .refine(
+    (limits) =>
+      limits.dailyUsd !== undefined ||
+      limits.weeklyUsd !== undefined ||
+      limits.perCollection !== undefined,
+    'lossLimits needs a cap: dailyUsd, weeklyUsd or perCollection',
+  );
 
 const tasksFile = z
   .object({
@@ -348,6 +426,15 @@ const tasksFile = z
     message: 'bidExit needs lossLimits: what an item cost is read from the fills it measures',
     path: ['lossLimits'],
   })
+  .refine(
+    (file) =>
+      file.lossLimits !== undefined ||
+      !file.tasks.some((task) => task.enabled && task.kind === 'listing' && task.aboveCost),
+    {
+      message: 'aboveCost needs lossLimits: what an item cost is read from the fills it measures',
+      path: ['lossLimits'],
+    },
+  )
   .refine((file) => file.resaleLimit !== undefined || !resellsFills(file), {
     message: 'resaleBid needs resaleLimit: its offers do not count against exposureLimit',
     path: ['resaleLimit'],

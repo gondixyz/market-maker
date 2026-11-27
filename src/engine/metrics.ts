@@ -1,5 +1,6 @@
 import { formatEther } from 'viem';
 
+import type { CollectionLoss } from './pnl';
 import type { RoundReport, TaskReport } from './runner';
 
 type Labels = Record<string, string>;
@@ -43,6 +44,44 @@ const perTask = (
     return value === undefined ? [] : [{ labels: taskLabels(task), value }];
   });
 
+/** Each collection's loss and caps of `lossLimits.perCollection`, per window, in ETH. */
+const collectionLossMetrics = (collections: CollectionLoss[]): Metric[] => {
+  const windows = collections.flatMap((collection) => [
+    {
+      labels: { collection: collection.slug, window: 'day' },
+      loss: collection.dailyLoss,
+      limit: collection.dailyLimit,
+    },
+    {
+      labels: { collection: collection.slug, window: 'week' },
+      loss: collection.weeklyLoss,
+      limit: collection.weeklyLimit,
+    },
+  ]);
+  return [
+    {
+      name: 'market_maker_collection_loss_eth',
+      help: "The collection's loss over the UTC day or the ISO week, in ETH, for each collection traded this week.",
+      samples: windows.map(({ labels, loss }) => ({ labels, value: toEth(loss) })),
+    },
+    {
+      name: 'market_maker_collection_loss_limit_eth',
+      help: "The collection's loss cap of each window, a percent of its floor, in ETH; absent without perCollection or a floor.",
+      samples: windows.flatMap(({ labels, limit }) =>
+        limit === null ? [] : [{ labels, value: toEth(limit) }],
+      ),
+    },
+    {
+      name: 'market_maker_collection_loss_limit_reached',
+      help: "Whether the collection's bids are stopped for its own loss.",
+      samples: collections.map((collection) => ({
+        labels: { collection: collection.slug },
+        value: collection.reached ? 1 : 0,
+      })),
+    },
+  ];
+};
+
 const lossMetrics = ({ loss, lossLimits }: RoundReport): Metric[] => {
   if (!loss || !lossLimits) return [];
   const windows = [
@@ -53,8 +92,10 @@ const lossMetrics = ({ loss, lossLimits }: RoundReport): Metric[] => {
   return [
     {
       name: 'market_maker_loss_limit_usd',
-      help: 'The loss cap of each window, in USD.',
-      samples: windows.map(({ window, limit }) => ({ labels: { window }, value: limit })),
+      help: "The wallet's loss cap of each window, in USD; absent for a window without one.",
+      samples: windows.flatMap(({ window, limit }) =>
+        limit === undefined ? [] : [{ labels: { window }, value: limit }],
+      ),
     },
     {
       name: 'market_maker_loss_usd',
@@ -73,9 +114,10 @@ const lossMetrics = ({ loss, lossLimits }: RoundReport): Metric[] => {
     },
     {
       name: 'market_maker_loss_limit_reached',
-      help: 'Whether bidding is stopped for the loss: at a cap, or unmeasured.',
+      help: "Whether every bid is stopped for the loss: the wallet's at a cap, or unmeasured.",
       samples: [{ labels: {}, value: !measured || measured.reached ? 1 : 0 }],
     },
+    ...collectionLossMetrics(measured?.collections ?? []),
   ];
 };
 

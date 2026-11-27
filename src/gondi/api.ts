@@ -39,7 +39,6 @@ const order = z.object({
   __typename: z.string(),
   id: z.string().transform(Number),
   price: amount,
-  steppedPrice: amount.nullable(),
   currencyAddress: address,
   maker: address,
   isAsk: z.boolean(),
@@ -58,7 +57,7 @@ const order = z.object({
 });
 
 const ORDER_FIELDS = `
-  __typename id price steppedPrice currencyAddress maker isAsk status startTime expiration
+  __typename id price currencyAddress maker isAsk status startTime expiration
   executions maxExecutions cancelsOffChain marketPlace marketPlaceAddress originalId
   ... on SingleNFTOrder { nft { id tokenId } }
   ... on CollectionOrder { collectionId }
